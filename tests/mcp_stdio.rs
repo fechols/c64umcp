@@ -38,6 +38,7 @@ async fn start_server_with_capture(
         "C64U_CAPTURE_IP",
         "C64U_CAPTURE_PORT",
         "C64U_CAPTURE_TIMEOUT",
+        "C64U_LOCK_DIR",
         "RUST_LOG",
     ] {
         command.env_remove(variable);
@@ -56,6 +57,8 @@ async fn start_server_with_capture(
             &port.to_string(),
         ]);
     }
+    // Keep test lock files out of the system temp directory.
+    command.args(["--lock-dir", env!("CARGO_TARGET_TMPDIR")]);
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let transport = TokioChildProcess::new(command).expect("spawn MCP executable");

@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::device::Device;
+use crate::{device::Device, lock::OperationGuard};
 
 const EMERGENCY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -206,7 +206,7 @@ async fn send_chord(device: &Device, inputs: &[String], transition: Transition) 
 struct KeyReleaseGuard {
     device: Device,
     active: Option<Vec<String>>,
-    operation_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    operation_guard: Option<Arc<OperationGuard>>,
     cleanup_deadline: Option<tokio::time::Instant>,
 }
 
@@ -269,7 +269,7 @@ pub async fn type_text(
     text: &str,
     hold_ms: u64,
     gap_ms: u64,
-    operation_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    operation_guard: Option<Arc<OperationGuard>>,
 ) -> Result<Value> {
     let chords = text_to_keys(text)?;
     ensure!(
@@ -509,7 +509,9 @@ mod tests {
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(2)).unwrap();
         let operation_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::new(operation_lock.clone().lock_owned().await);
+        let guard = Arc::new(OperationGuard::gate_only(
+            operation_lock.clone().lock_owned().await,
+        ));
         let typing =
             tokio::spawn(async move { type_text(&device, "ab", 1000, 1, Some(guard)).await });
         tokio::time::timeout(Duration::from_secs(2), pressed.notified())
@@ -545,7 +547,7 @@ mod tests {
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(10)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::new(lock.clone().lock_owned().await);
+        let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let error = type_text(&device, "A", 1, 1, Some(guard))
             .await
             .unwrap_err()
@@ -578,7 +580,7 @@ mod tests {
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(15)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::new(lock.clone().lock_owned().await);
+        let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let error = tokio::time::timeout(
             Duration::from_secs(5),
             type_text(&device, "A", 1, 1, Some(guard)),
@@ -616,7 +618,7 @@ mod tests {
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(15)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::new(lock.clone().lock_owned().await);
+        let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let typing = tokio::spawn(async move { type_text(&device, "A", 1, 1, Some(guard)).await });
         tokio::time::timeout(Duration::from_secs(2), cleanup_started.notified())
             .await

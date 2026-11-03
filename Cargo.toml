@@ -3,7 +3,7 @@ name = "c64umcp"
 version = "0.1.0"
 edition = "2024"
 description = "A local MCP server for Commodore 64 Ultimate devices"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"

@@ -1,7 +1,9 @@
 //! Typed MCP tools and shared per-device serialization.
 use crate::{
     device::{Device, MAX_BODY_BYTES as MAX_FILE, REU_CHUNK, REU_SIZE},
-    input, screen, video,
+    input,
+    lock::{self, OperationGuard},
+    screen, video,
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -15,7 +17,12 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::AsyncReadExt,
     sync::{Mutex, RwLock},
@@ -31,6 +38,8 @@ const RESUME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct C64Server {
     device: Device,
     gate: Arc<Mutex<()>>,
+    /// Cross-process lock file for this device; None disables it.
+    device_lock: Option<Arc<PathBuf>>,
     accepting_calls: Arc<RwLock<bool>>,
     capture_ip: Option<Ipv4Addr>,
     capture_port: u16,
@@ -47,12 +56,34 @@ impl C64Server {
         Self {
             device,
             gate: Arc::new(Mutex::new(())),
+            device_lock: None,
             accepting_calls: Arc::new(RwLock::new(true)),
             capture_ip,
             capture_port,
             capture_timeout,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Serialize multi-step and destructive operations with other server
+    /// processes on this computer through a lock file in `dir`, named after
+    /// the device host. Without a configured host there is nothing to lock.
+    pub fn with_lock_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.device_lock = self
+            .device
+            .base_url()
+            .and_then(|base| lock::lock_path(dir.as_ref(), base))
+            .map(Arc::new);
+        self
+    }
+
+    /// Take the in-process gate, then the cross-process device lock.
+    async fn operation(&self) -> Result<OperationGuard> {
+        lock::acquire(
+            &self.gate,
+            self.device_lock.as_deref().map(PathBuf::as_path),
+        )
+        .await
     }
 
     /// Finish device cleanup after the MCP service has stopped and cancelled
@@ -86,6 +117,16 @@ impl C64Server {
     ) -> CallToolResult {
         let _guard = self.gate.lock().await;
         result(self.device.json(method, route, &query, body).await)
+    }
+    /// Like `request`, but also holds the cross-process device lock.
+    async fn locked_request(&self, method: Method, route: &str) -> CallToolResult {
+        result(
+            async {
+                let _guard = self.operation().await?;
+                self.device.json(method, route, &[], None).await
+            }
+            .await,
+        )
     }
     async fn drive_action(&self, drive: Drive, verb: &str) -> CallToolResult {
         self.request(
@@ -126,7 +167,7 @@ impl C64Server {
                     },
                 };
                 let route = format!("runners:{command}");
-                let _guard = self.gate.lock().await;
+                let _guard = self.operation().await?;
                 match source {
                     ResolvedSource::Remote(path) => {
                         query.push(("file".into(), path));
@@ -255,7 +296,7 @@ fn reu_writes(address: u32, data: &[u8], guard: Option<(u32, usize)>) -> Vec<(u3
 struct ResumeGuard {
     device: Device,
     armed: bool,
-    operation_guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    operation_guard: Arc<OperationGuard>,
 }
 impl ResumeGuard {
     async fn resume(&mut self) -> Result<()> {
@@ -726,40 +767,35 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn reset_machine(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:reset", vec![], None)
-            .await
+        self.locked_request(Method::PUT, "machine:reset").await
     }
     #[tool(
         description = "Restart the machine and reinitialize cartridge configuration.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn reboot_machine(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:reboot", vec![], None)
-            .await
+        self.locked_request(Method::PUT, "machine:reboot").await
     }
     #[tool(
         description = "Pause the CPU until resume_machine; timers may continue.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn pause_machine(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:pause", vec![], None)
-            .await
+        self.locked_request(Method::PUT, "machine:pause").await
     }
     #[tool(
         description = "Resume the paused CPU.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn resume_machine(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:resume", vec![], None)
-            .await
+        self.locked_request(Method::PUT, "machine:resume").await
     }
     #[tool(
         description = "Power off supported hardware. A disconnect leaves the outcome uncertain.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn poweroff_machine(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:poweroff", vec![], None)
-            .await
+        self.locked_request(Method::PUT, "machine:poweroff").await
     }
     #[tool(
         description = "Toggle the firmware menu. While open, injected keys reach the menu.",
@@ -1009,7 +1045,7 @@ impl C64Server {
                 let reset = p.reset;
                 let pause = p.pause.unwrap_or(!reset);
 
-                let operation_guard = Arc::new(self.gate.clone().lock_owned().await);
+                let operation_guard = Arc::new(self.operation().await?);
                 // Reset first, so the old program cannot DMA into the REU while
                 // it is written. Nothing is armed yet, so failure needs no cleanup.
                 if reset {
@@ -1216,26 +1252,28 @@ impl C64Server {
                 "destination must be IPv4 or IPv4:port"
             )));
         }
-        self.request(
-            Method::PUT,
-            &format!("streams/{}:start", p.stream.name()),
-            vec![("ip".into(), p.destination)],
-            None,
+        result(
+            async {
+                let _guard = self.operation().await?;
+                self.device
+                    .json(
+                        Method::PUT,
+                        &format!("streams/{}:start", p.stream.name()),
+                        &[("ip".into(), p.destination)],
+                        None,
+                    )
+                    .await
+            }
+            .await,
         )
-        .await
     }
     #[tool(
         description = "Stop a video, audio or debug UDP stream.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stop_stream(&self, Parameters(p): Parameters<StreamStop>) -> CallToolResult {
-        self.request(
-            Method::PUT,
-            &format!("streams/{}:stop", p.stream.name()),
-            vec![],
-            None,
-        )
-        .await
+        self.locked_request(Method::PUT, &format!("streams/{}:stop", p.stream.name()))
+            .await
     }
     #[tool(
         description = "Read metadata for an absolute device file path. Firmware-dependent, not a directory listing.",
@@ -1320,7 +1358,10 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn type_text(&self, Parameters(p): Parameters<TypeText>) -> CallToolResult {
-        let guard = Arc::new(self.gate.clone().lock_owned().await);
+        let guard = match self.operation().await {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => return result(Err(error)),
+        };
         result(input::type_text(&self.device, &p.text, p.hold_ms, p.gap_ms, Some(guard)).await)
     }
     #[tool(
@@ -1380,7 +1421,10 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn capture_screenshot(&self) -> CallToolResult {
-        let guard = Arc::new(self.gate.clone().lock_owned().await);
+        let guard = match self.operation().await {
+            Ok(guard) => Arc::new(guard),
+            Err(error) => return result(Err(error)),
+        };
         match video::capture(
             &self.device,
             self.capture_ip,

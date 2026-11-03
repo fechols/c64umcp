@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 78 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 80 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -13,7 +13,7 @@ hardware testing. See the [results and coverage](docs/hardware-results.md).
 
 ## Build and connect
 
-Requires Rust 1.88 or newer.
+Requires Rust 1.89 or newer.
 
 ```powershell
 cargo build --release --locked
@@ -55,6 +55,7 @@ Restart the server after changing its environment.
 | `--capture-ip` | `C64U_CAPTURE_IP` | Infer this computer's IPv4 interface |
 | `--capture-port` | `C64U_CAPTURE_PORT` | 11000 (0 picks a free port per capture) |
 | `--capture-timeout` | `C64U_CAPTURE_TIMEOUT` | 5 seconds; range 1–60 |
+| `--lock-dir` | `C64U_LOCK_DIR` | The system temp directory (`%TEMP%`, `$TMPDIR` or `/tmp`) |
 
 CLI options override environment values. Host accepts a hostname, IP, optional
 port, or HTTP(S) root URL, with optional `/v1`. It does not accept credentials,
@@ -78,6 +79,18 @@ query strings, fragments, or arbitrary URL paths. LAN requests bypass system pro
 Tools advertise JSON schemas and read-only/destructive annotations. Results include
 structured JSON and readable text. Screenshots return MCP image content.
 Machine operations and entire input/capture workflows are serialized per server.
+
+Several agents often drive one C64U, each through its own server process. The
+multi-step and destructive tools (`upload_reu`, `type_text`,
+`capture_screenshot`, `start_stream`, `stop_stream`, `run_prg`, `run_crt`,
+`load_prg`, `play_sid`, `play_mod`, `reset_machine`, `reboot_machine`,
+`poweroff_machine`, `pause_machine`, `resume_machine`) therefore also take an
+OS file lock, `c64umcp-<host>.lock` in the lock directory, for their whole
+run, including cleanup. A second server on **the same computer** waits for
+it, so one agent's pause, reset, upload or capture cannot interleave with
+another's. The lock does not reach servers on other computers, servers using
+another lock directory, or the same device configured under another
+hostname or address; other tools are serialized per process only.
 Annotations describe effects; they are not a separate permission system.
 On a normal MCP stdin close, the server waits (up to 10 seconds) for active
 handlers and bounded keyboard/video cleanup before exiting.

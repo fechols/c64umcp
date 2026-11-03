@@ -2,7 +2,7 @@
 //! service socket. No configured device is contacted.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -114,6 +114,7 @@ async fn fake_dma(log: Log, behavior: Dma) -> (u16, Option<JoinHandle<()>>) {
 struct Harness {
     http: MockServer,
     log: Log,
+    dma_port: u16,
     client: RunningService<RoleClient, ()>,
     server: JoinHandle<()>,
     dma: Option<JoinHandle<()>>,
@@ -121,27 +122,18 @@ struct Harness {
 
 impl Harness {
     async fn new(password: Option<&str>, behavior: Dma) -> Self {
+        Self::with_lock_dir(password, behavior, None).await
+    }
+
+    async fn with_lock_dir(password: Option<&str>, behavior: Dma, lock_dir: Option<&Path>) -> Self {
         let http = MockServer::start().await;
         let log = Log::default();
-        let (port, dma) = fake_dma(log.clone(), behavior).await;
-        let device = Device::new(Some(&http.uri()), password, Duration::from_secs(2))
-            .unwrap()
-            .with_dma_port(port);
-        let server = C64Server::new(device, None, 0, Duration::from_secs(2));
-        let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
-        let server = tokio::spawn(async move {
-            server
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
-        });
-        let client = ().serve(client_transport).await.unwrap();
+        let (dma_port, dma) = fake_dma(log.clone(), behavior).await;
+        let (client, server) = connect(&http.uri(), password, dma_port, lock_dir).await;
         Self {
             http,
             log,
+            dma_port,
             client,
             server,
             dma,
@@ -243,6 +235,34 @@ impl Harness {
             dma.abort();
         }
     }
+}
+
+/// Serve one MCP server for the device at `uri`, as a separate C64Server.
+async fn connect(
+    uri: &str,
+    password: Option<&str>,
+    dma_port: u16,
+    lock_dir: Option<&Path>,
+) -> (RunningService<RoleClient, ()>, JoinHandle<()>) {
+    let device = Device::new(Some(uri), password, Duration::from_secs(2))
+        .unwrap()
+        .with_dma_port(dma_port);
+    let mut server = C64Server::new(device, None, 0, Duration::from_secs(2));
+    if let Some(dir) = lock_dir {
+        server = server.with_lock_dir(dir);
+    }
+    let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
+    let server = tokio::spawn(async move {
+        server
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap();
+    });
+    let client = ().serve(client_transport).await.unwrap();
+    (client, server)
 }
 
 struct TemporaryFile(PathBuf);
@@ -682,5 +702,68 @@ async fn invalid_ranges_and_sources_never_reach_the_device() {
         .await;
     assert_eq!(extra.is_error, Some(true));
     assert!(h.events().is_empty(), "{:?}", h.events());
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn servers_sharing_a_device_lock_never_interleave_uploads() {
+    let lock_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("reu-locks-{}", std::process::id()));
+    let h = Harness::with_lock_dir(None, Dma::Normal, Some(&lock_dir)).await;
+    let log = h.log.clone();
+    // A slow reset keeps the first upload inside the lock while the second starts.
+    Mock::given(method("PUT"))
+        .and(path("/v1/machine:reset"))
+        .respond_with(move |_: &wiremock::Request| {
+            push(&log, Event::Rest("reset"));
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"errors":[]}))
+                .set_delay(Duration::from_millis(400))
+        })
+        .expect(2)
+        .mount(&h.http)
+        .await;
+    let (mut other, other_server) = connect(&h.http.uri(), None, h.dma_port, Some(&lock_dir)).await;
+    let first = h
+        .send(json!({
+            "source": {"kind":"base64","filename":"a.bin","data":STANDARD.encode([1])},
+            "address": "0",
+        }))
+        .await;
+    h.wait_for(Event::Rest("reset")).await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        other.call_tool(
+            CallToolRequestParams::new("upload_reu").with_arguments(
+                json!({
+                    "source": {"kind":"base64","filename":"b.bin","data":STANDARD.encode([2])},
+                    "address": "0",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(second.is_error, Some(true), "{:?}", second.content);
+    first.await_response().await.unwrap();
+    assert_eq!(
+        h.events(),
+        [
+            Event::Rest("reset"),
+            Event::Connect,
+            Event::Write(0, vec![1]),
+            Event::Identify,
+            Event::Rest("reset"),
+            Event::Connect,
+            Event::Write(0, vec![2]),
+            Event::Identify,
+        ]
+    );
+    other.close().await.unwrap();
+    other_server.await.unwrap();
     h.finish().await;
 }

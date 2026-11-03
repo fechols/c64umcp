@@ -2,7 +2,7 @@ use anyhow::{Result, ensure};
 use c64umcp::{device::Device, server::C64Server};
 use clap::Parser;
 use rmcp::{ServiceExt, transport::stdio};
-use std::{net::Ipv4Addr, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -22,6 +22,10 @@ struct Options {
     /// Maximum time to wait for a complete video frame, in seconds.
     #[arg(long, env = "C64U_CAPTURE_TIMEOUT", default_value_t = 5)]
     capture_timeout: u64,
+    /// Directory for the per-device lock file that serializes operations with
+    /// other server processes on this computer; default: the system temp directory.
+    #[arg(long, env = "C64U_LOCK_DIR")]
+    lock_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -53,7 +57,8 @@ async fn main() -> Result<()> {
         options.capture_ip,
         options.capture_port,
         Duration::from_secs(options.capture_timeout),
-    );
+    )
+    .with_lock_dir(options.lock_dir.unwrap_or_else(std::env::temp_dir));
     let service = server.clone().serve(stdio()).await?;
     let outcome = service.waiting().await;
     // rmcp cancels remaining requests when the transport closes, but does not

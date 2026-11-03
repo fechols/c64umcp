@@ -14,9 +14,9 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::Method;
-use tokio::{net::UdpSocket, sync::OwnedMutexGuard};
+use tokio::net::UdpSocket;
 
-use crate::device::Device;
+use crate::{device::Device, lock::OperationGuard};
 
 const WIDTH: usize = 384;
 const MAX_HEIGHT: usize = 272;
@@ -174,7 +174,7 @@ impl VideoAssembler {
 /// including when the MCP request is cancelled and this guard is dropped.
 struct StreamCleanup {
     device: Device,
-    operation_guard: Option<Arc<OwnedMutexGuard<()>>>,
+    operation_guard: Option<Arc<OperationGuard>>,
     armed: bool,
 }
 
@@ -296,7 +296,7 @@ pub async fn capture(
     capture_ip: Option<Ipv4Addr>,
     port: u16,
     timeout: Duration,
-    operation_guard: Option<Arc<OwnedMutexGuard<()>>>,
+    operation_guard: Option<Arc<OperationGuard>>,
 ) -> Result<Vec<u8>> {
     ensure!(
         !timeout.is_zero() && timeout <= Duration::from_secs(60),
@@ -701,7 +701,7 @@ mod tests {
             .mount(&server)
             .await;
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let operation_guard = Arc::new(lock.clone().lock_owned().await);
+        let operation_guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let task = tokio::spawn(async move {
             capture(
                 &device,
@@ -771,7 +771,7 @@ mod tests {
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(15)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let operation_guard = Arc::new(lock.clone().lock_owned().await);
+        let operation_guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let task = tokio::spawn(async move {
             let mut cleanup = StreamCleanup {
                 device,
