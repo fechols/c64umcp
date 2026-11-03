@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 89 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 91 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -287,7 +287,12 @@ Cancellation attempts cleanup; communication failure or abrupt process terminati
 can leave a stream running. Use `stop_stream` if needed.
 
 `read_text_screen` is a separate 40×25 memory interpretation, default address
-`0400`; `include_colors:true` also reads color RAM. It assumes the default
+`0400`; `include_colors:true` also reads color RAM. That read goes through the
+CPU's memory map at $D800, so the tool also reads the processor port
+($00/$01) and adds `colors_reliable`: `false` means I/O was banked out (LORAM
+and HIRAM low, or CHAREN low) and the colors are RAM or character ROM bytes.
+Cartridge mappings are not considered. Screen codes $60 and $E0 (shifted
+space) decode as a space. It assumes the default
 uppercase/graphics character set and preserves raw codes. It does not reproduce
 sprites, bitmap graphics, custom glyphs or raster effects.
 `read_menu_screen` decodes firmware UI bytes and packed foreground/background

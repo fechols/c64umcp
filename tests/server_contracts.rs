@@ -469,11 +469,16 @@ async fn menu_and_text_snapshots_decode_their_distinct_binary_formats() {
         .await;
     let mut screen = vec![32; 1000];
     screen[..2].copy_from_slice(&[1, 0x82]);
-    for (address, bytes) in [("0400", screen), ("D800", vec![0xf6; 1000])] {
+    for (address, bytes) in [
+        ("0400", screen),
+        ("D800", vec![0xf6; 1000]),
+        ("0000", vec![0x2f, 0x37]),
+    ] {
+        let length = bytes.len().to_string();
         Mock::given(method("GET"))
             .and(path("/v1/machine:readmem"))
             .and(query_param("address", address))
-            .and(query_param("length", "1000"))
+            .and(query_param("length", length))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(bytes)
@@ -495,6 +500,7 @@ async fn menu_and_text_snapshots_decode_their_distinct_binary_formats() {
     assert!(screen["rows"][0].as_str().unwrap().starts_with("AB"));
     assert_eq!(screen["reverse"][1], true);
     assert_eq!(screen["colors"][0], 6);
+    assert_eq!(screen["colors_reliable"], true);
     h.finish().await;
 }
 

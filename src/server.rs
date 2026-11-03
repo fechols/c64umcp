@@ -1529,7 +1529,7 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Read a 40x25 text-memory snapshot (default $0400), optionally color RAM. Not a screenshot: custom glyphs, bitmap graphics, sprites and raster effects are not represented.",
+        description = "Read a 40x25 text-memory snapshot (default $0400), optionally color RAM. Color RAM is read through the CPU memory map at $D800, so with include_colors the result adds colors_reliable, false when the processor port ($00/$01) has I/O banked out and $D800 holds RAM or character ROM instead. Not a screenshot: custom glyphs, bitmap graphics, sprites and raster effects are not represented.",
         annotations(read_only_hint = true)
     )]
     async fn read_text_screen(&self, Parameters(p): Parameters<TextScreen>) -> CallToolResult {
@@ -1547,23 +1547,43 @@ impl C64Server {
                         ],
                     )
                     .await?;
-                let colors = if p.include_colors {
-                    Some(
-                        self.device
-                            .binary(
-                                "machine:readmem",
-                                &[
-                                    ("address".into(), "D800".into()),
-                                    ("length".into(), "1000".into()),
-                                ],
-                            )
-                            .await?,
-                    )
+                let (colors, colors_reliable) = if p.include_colors {
+                    // $D800 is color RAM only while I/O is banked in; read
+                    // the processor port to tell.
+                    let port = self
+                        .device
+                        .binary(
+                            "machine:readmem",
+                            &[
+                                ("address".into(), "0000".into()),
+                                ("length".into(), "2".into()),
+                            ],
+                        )
+                        .await?;
+                    ensure!(
+                        port.len() == 2,
+                        "processor port read returned {} bytes",
+                        port.len()
+                    );
+                    let colors = self
+                        .device
+                        .binary(
+                            "machine:readmem",
+                            &[
+                                ("address".into(), "D800".into()),
+                                ("length".into(), "1000".into()),
+                            ],
+                        )
+                        .await?;
+                    (Some(colors), Some(screen::io_visible(port[0], port[1])))
                 } else {
-                    None
+                    (None, None)
                 };
                 let mut value = screen::decode_text(&bytes, colors.as_deref())?;
                 value["address"] = json!(format!("{address:04X}"));
+                if let Some(reliable) = colors_reliable {
+                    value["colors_reliable"] = json!(reliable);
+                }
                 Ok(value)
             }
             .await,
