@@ -166,6 +166,11 @@ impl Harness {
             .await;
     }
 
+    async fn reset(&self, status: u16, times: u64) {
+        self.rest("PUT", "machine:reset", "reset", status, times)
+            .await;
+    }
+
     async fn machine(&self, pauses: u64, resumes: u64) {
         self.rest("PUT", "machine:pause", "pause", 200, pauses)
             .await;
@@ -277,9 +282,10 @@ fn writes(events: &[Event]) -> Vec<(u32, usize)> {
 }
 
 #[tokio::test]
-async fn guarded_upload_pauses_zeroes_guard_writes_it_last_resumes_then_runs() {
+async fn guarded_upload_resets_zeroes_guard_writes_it_last_then_runs() {
     let h = Harness::new(None, Dma::Normal).await;
-    h.machine(1, 1).await;
+    h.reset(200, 1).await;
+    h.machine(0, 0).await;
     h.rest("POST", "runners:run_prg", "run_prg", 200, 1).await;
     let data = pattern(70000);
     let mut file = vec![0xAA; 100];
@@ -302,12 +308,13 @@ async fn guarded_upload_pauses_zeroes_guard_writes_it_last_resumes_then_runs() {
             "bytes_written":70000,
             "chunks":4,
             "guard":{"address":"560000","length":16,"zero_chunks":1},
-            "paused":true,
+            "reset":true,
+            "paused":false,
             "ran":true,
         })
     );
     let events = h.events();
-    assert_eq!(events.first(), Some(&Event::Rest("pause")));
+    assert_eq!(events.first(), Some(&Event::Rest("reset")));
     assert_eq!(events[1], Event::Connect);
     assert_eq!(events[2], Event::Write(0x560000, vec![0; 16]));
     assert_eq!(
@@ -321,12 +328,8 @@ async fn guarded_upload_pauses_zeroes_guard_writes_it_last_resumes_then_runs() {
         ]
     );
     assert_eq!(
-        &events[events.len() - 3..],
-        [
-            Event::Identify,
-            Event::Rest("resume"),
-            Event::Rest("run_prg")
-        ]
+        &events[events.len() - 2..],
+        [Event::Identify, Event::Rest("run_prg")]
     );
     // Reassemble the REU image from the data writes: it must equal the slice.
     let mut image = vec![0xEE; data.len()];
@@ -338,11 +341,11 @@ async fn guarded_upload_pauses_zeroes_guard_writes_it_last_resumes_then_runs() {
     }
     assert_eq!(image, data);
     assert_eq!(
-        events[events.len() - 4],
+        events[events.len() - 3],
         Event::Write(0x560000, data[..16].to_vec())
     );
     let requests = h.http.received_requests().await.unwrap();
-    assert!(requests[2].body.windows(3).any(|window| window == prg));
+    assert!(requests[1].body.windows(3).any(|window| window == prg));
     h.finish().await;
 }
 
@@ -357,10 +360,12 @@ async fn unpaused_upload_chunks_at_32_kib_with_explicit_length_and_no_rest_calls
             "offset": 1,
             "length": 65536,
             "address": "0xFF0000",
+            "reset": false,
             "pause": false,
         }))
         .await;
     assert_eq!(result["chunks"], 2);
+    assert_eq!(result["reset"], false);
     assert_eq!(result["paused"], false);
     assert_eq!(result["ran"], false);
     assert_eq!(result["guard"], Value::Null);
@@ -378,12 +383,61 @@ async fn unpaused_upload_chunks_at_32_kib_with_explicit_length_and_no_rest_calls
 }
 
 #[tokio::test]
+async fn failed_reset_connects_to_nothing_and_never_pauses() {
+    let h = Harness::new(None, Dma::Normal).await;
+    h.reset(500, 1).await;
+    h.machine(0, 0).await;
+    h.rest("POST", "runners:run_prg", "run_prg", 200, 0).await;
+    h.failure(
+        json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
+            "address": "0",
+            "pause": true,
+            "run_prg": {"kind":"base64","filename":"start.prg","data":STANDARD.encode([1, 8, 0x60])},
+        }),
+        "could not reset the C64; nothing was written",
+    )
+    .await;
+    assert_eq!(h.events(), [Event::Rest("reset")]);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn reset_and_pause_together_reset_first() {
+    let h = Harness::new(None, Dma::Normal).await;
+    h.reset(200, 1).await;
+    h.machine(1, 1).await;
+    let result = h
+        .success(json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2])},
+            "address": "0",
+            "pause": true,
+        }))
+        .await;
+    assert_eq!(result["reset"], true);
+    assert_eq!(result["paused"], true);
+    assert_eq!(
+        h.events(),
+        [
+            Event::Rest("reset"),
+            Event::Rest("pause"),
+            Event::Connect,
+            Event::Write(0, vec![1, 2]),
+            Event::Identify,
+            Event::Rest("resume"),
+        ]
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn password_authenticates_the_dma_socket_before_any_write() {
     let h = Harness::new(Some("offline-secret"), Dma::Normal).await;
     h.machine(1, 1).await;
     h.success(json!({
         "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2, 3])},
         "address": "0",
+        "reset": false,
     }))
     .await;
     assert_eq!(
@@ -409,6 +463,7 @@ async fn refused_authentication_writes_nothing_and_still_resumes() {
         json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2, 3])},
             "address": "0",
+            "reset": false,
             "run_prg": {"kind":"base64","filename":"start.prg","data":STANDARD.encode([1, 8, 0x60])},
         }),
         "DMA authentication refused",
@@ -440,6 +495,7 @@ async fn socket_failures_still_resume_and_skip_run_prg() {
             json!({
                 "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode(pattern(200000))},
                 "address": "100000",
+                "reset": false,
                 "run_prg": {"kind":"base64","filename":"start.prg","data":STANDARD.encode([1, 8, 0x60])},
             }),
             message,
@@ -463,6 +519,7 @@ async fn failed_pause_writes_nothing() {
         json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
             "address": "0",
+            "reset": false,
         }),
         "could not pause the C64; nothing was written",
     )
@@ -479,6 +536,7 @@ async fn dropped_authentication_does_not_claim_a_partial_write() {
         .call(json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
             "address": "0",
+            "reset": false,
         }))
         .await;
     assert_eq!(result.is_error, Some(true));
@@ -520,6 +578,7 @@ async fn cancelled_pause_request_still_resumes() {
         .send(json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
             "address": "0",
+            "reset": false,
         }))
         .await;
     h.wait_for(Event::Rest("pause")).await;
@@ -539,6 +598,7 @@ async fn cancelled_transfer_still_resumes() {
         .send(json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2])},
             "address": "0",
+            "reset": false,
         }))
         .await;
     h.wait_for(Event::Identify).await;

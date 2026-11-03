@@ -425,10 +425,12 @@ pub struct UploadReu {
     pub offset: usize,
     /// Bytes to write; default is the rest of the file after offset.
     pub length: Option<usize>,
-    /// Pause the C64 CPU before writing and resume it afterwards, even if the write fails; default true. The CPU is resumed even if it was already paused before the call; pass false to leave its state alone.
+    /// Reset the C64 before writing, so no running program can DMA into the REU during the upload; default true. After a reset only the KERNAL and BASIC run, and neither touches the REU. Pass false to feed data into a running program.
     #[serde(default = "default_true")]
-    pub pause: bool,
-    /// Range inside the written range that is zeroed before any other write and receives its data last, so a program polling a header there never sees a stale or partial image.
+    pub reset: bool,
+    /// Pause the C64 CPU before writing (after any reset) and resume it afterwards, even if the write fails; default is the opposite of reset, so false after a reset and true without one. The CPU is resumed even if it was already paused before the call.
+    pub pause: Option<bool>,
+    /// Range inside the written range that is zeroed before any other write and receives its data last, so a program polling a header there never sees a stale or partial image. Live-feeding a running program this way needs reset: false.
     pub guard: Option<ReuRange>,
     /// PRG to reset, load and run after the upload and resume, exactly like run_prg.
     pub run_prg: Option<FileSource>,
@@ -951,7 +953,7 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Write a local or base64 file (optionally an offset/length slice, up to 16 MiB) into REU memory at a 24-bit hexadecimal address over the Ultimate DMA service (TCP port 64). Pauses the CPU during the write by default and always resumes it afterwards, even if it was already paused; use pause=false to leave the CPU state alone. Writes beyond the configured REU size are not detected. An optional guard range inside the written range is zeroed first and written last. Optional run_prg then resets and runs a PRG.",
+        description = "Write a local or base64 file (optionally an offset/length slice, up to 16 MiB) into REU memory at a 24-bit hexadecimal address over the Ultimate DMA service (TCP port 64). Resets the C64 first by default, so no running program can DMA into the REU during the upload; pass reset=false to feed a running program. pause (default: true only when reset is false) pauses the CPU during the write and always resumes it afterwards, even if it was already paused. Writes beyond the configured REU size are not detected. An optional guard range inside the written range is zeroed first and written last. Optional run_prg then resets and runs a PRG.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn upload_reu(&self, Parameters(p): Parameters<UploadReu>) -> CallToolResult {
@@ -1004,11 +1006,22 @@ impl C64Server {
                 let writes = reu_writes(address, data, guard);
                 let guard_chunks = guard.map_or(0, |(_, length)| length.div_ceil(REU_CHUNK));
 
+                let reset = p.reset;
+                let pause = p.pause.unwrap_or(!reset);
+
                 let operation_guard = Arc::new(self.gate.clone().lock_owned().await);
+                // Reset first, so the old program cannot DMA into the REU while
+                // it is written. Nothing is armed yet, so failure needs no cleanup.
+                if reset {
+                    self.device
+                        .json(Method::PUT, "machine:reset", &[], None)
+                        .await
+                        .context("could not reset the C64; nothing was written (a timed-out reset may still have happened)")?;
+                }
                 // Arm the resume before sending the pause: a pause that times
                 // out, or a call cancelled while it is in flight, may still have
                 // paused the CPU. Resuming a running CPU is harmless.
-                let mut resume = p.pause.then(|| ResumeGuard {
+                let mut resume = pause.then(|| ResumeGuard {
                     device: self.device.clone(),
                     armed: true,
                     operation_guard: operation_guard.clone(),
@@ -1079,7 +1092,8 @@ impl C64Server {
                         "length": guard_length,
                         "zero_chunks": guard_chunks,
                     })),
-                    "paused": p.pause,
+                    "reset": reset,
+                    "paused": pause,
                     "ran": ran,
                 }))
             }

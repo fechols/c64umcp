@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 76 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 78 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -169,13 +169,21 @@ too, and the HTTP timeout applies to each socket operation.
   (default: all of it). Files follow the usual 32 MiB upload limit.
 - Data goes in writes of at most 32 KiB. The tool returns only after the
   device answers an IDENTIFY sent behind the last write, so all writes are done.
-- `pause` (default `true`) pauses the CPU first, so a running program cannot
-  race the upload with its own REU DMA, and resumes it afterwards, also when the
-  write fails. If the pause fails, nothing is written and the server still
-  sends a resume, because a timed-out pause may have taken effect. If a call is
-  cancelled while pausing or paused, the server still tries to resume, with a
-  three-second bound. The CPU is resumed even if it was already paused before
-  the call; pass `pause: false` to leave its state alone.
+- `reset` (default `true`) resets the C64 before anything is written, so the
+  program that was running cannot race the upload with its own REU DMA (a game
+  stashing state every frame, a player streaming samples). After a reset only
+  the KERNAL and BASIC run, and neither touches the REU. If the reset fails,
+  nothing is written; a timed-out reset may still have happened. To feed data
+  into a program that is running (for example with `guard`), pass
+  `reset: false`.
+- `pause` (default: the opposite of `reset`, so `false` after a reset and
+  `true` without one) pauses the CPU before the write, after any reset, and
+  resumes it afterwards, also when the write fails. If the pause fails, nothing
+  is written and the server still sends a resume, because a timed-out pause may
+  have taken effect. If a call is cancelled while pausing or paused, the server
+  still tries to resume, with a three-second bound. The CPU is resumed even if
+  it was already paused before the call; pass `pause: false` to leave its state
+  alone.
 - The range is checked only against the 24-bit limit, not against the REU size
   configured on the device. Make sure an REU is enabled and large enough: writes
   past its size may wrap or be lost while the tool still reports success.
@@ -187,7 +195,7 @@ too, and the HTTP timeout applies to each socket operation.
   a PRG after the upload and resume; it is skipped if the upload fails.
 
 The result reports `address`, `bytes_written`, `chunks` (data writes),
-`guard` (with its `zero_chunks`) or null, `paused`, and `ran`.
+`guard` (with its `zero_chunks`) or null, `reset`, `paused`, and `ran`.
 A failure during the transfer can leave part of the range written.
 
 ### Keyboard, joystick and text
