@@ -14,8 +14,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use c64umcp::{device::Device, server::C64Server};
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult},
-    service::RunningService,
+    model::{CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest},
+    service::{PeerRequestOptions, RequestHandle, RunningService},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -48,7 +48,9 @@ fn push(log: &Log, event: Event) {
 enum Dma {
     Normal,
     RefuseAuth,
+    CloseOnAuth,
     CloseAfterWrites(usize),
+    NoIdentifyReply,
     Closed,
 }
 
@@ -81,6 +83,9 @@ async fn fake_dma(log: Log, behavior: Dma) -> (u16, Option<JoinHandle<()>>) {
                 match command {
                     0xff1f => {
                         push(&log, Event::Auth(payload));
+                        if matches!(behavior, Dma::CloseOnAuth) {
+                            break;
+                        }
                         let refuse = matches!(behavior, Dma::RefuseAuth);
                         let _ = stream.write_all(&[if refuse { 0 } else { 1 }]).await;
                     }
@@ -94,7 +99,9 @@ async fn fake_dma(log: Log, behavior: Dma) -> (u16, Option<JoinHandle<()>>) {
                     }
                     0xff0e if payload.is_empty() => {
                         push(&log, Event::Identify);
-                        let _ = stream.write_all(b"\x0bULTIMATE-II").await;
+                        if !matches!(behavior, Dma::NoIdentifyReply) {
+                            let _ = stream.write_all(b"\x0bULTIMATE-II").await;
+                        }
                     }
                     other => push(&log, Event::Unknown(other)),
                 }
@@ -190,6 +197,30 @@ impl Harness {
         assert_eq!(result.is_error, Some(true), "upload_reu should fail");
         let text = serde_json::to_string(&result.content).unwrap();
         assert!(text.contains(message), "{text}");
+    }
+
+    /// Start a call that the test can cancel through MCP.
+    async fn send(&self, args: Value) -> RequestHandle<RoleClient> {
+        self.client
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(
+                    CallToolRequestParams::new("upload_reu")
+                        .with_arguments(args.as_object().unwrap().clone()),
+                )),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for(&self, event: Event) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.events().contains(&event) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{event:?} never happened: {:?}", self.events()));
     }
 
     fn events(&self) -> Vec<Event> {
@@ -426,7 +457,8 @@ async fn socket_failures_still_resume_and_skip_run_prg() {
 async fn failed_pause_writes_nothing() {
     let h = Harness::new(None, Dma::Normal).await;
     h.rest("PUT", "machine:pause", "pause", 500, 1).await;
-    h.rest("PUT", "machine:resume", "resume", 200, 0).await;
+    // A failed pause may still have paused the CPU, so it is resumed anyway.
+    h.rest("PUT", "machine:resume", "resume", 200, 1).await;
     h.failure(
         json!({
             "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
@@ -435,7 +467,95 @@ async fn failed_pause_writes_nothing() {
         "could not pause the C64; nothing was written",
     )
     .await;
-    assert_eq!(h.events(), [Event::Rest("pause")]);
+    assert_eq!(h.events(), [Event::Rest("pause"), Event::Rest("resume")]);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn dropped_authentication_does_not_claim_a_partial_write() {
+    let h = Harness::new(Some("secret"), Dma::CloseOnAuth).await;
+    h.machine(1, 1).await;
+    let result = h
+        .call(json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
+            "address": "0",
+        }))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let text = serde_json::to_string(&result.content).unwrap();
+    assert!(
+        text.contains("DMA authentication failed; nothing was written"),
+        "{text}"
+    );
+    assert!(!text.contains("may have been written"), "{text}");
+    assert_eq!(
+        h.events(),
+        [
+            Event::Rest("pause"),
+            Event::Connect,
+            Event::Auth(b"secret".to_vec()),
+            Event::Rest("resume"),
+        ]
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn cancelled_pause_request_still_resumes() {
+    let h = Harness::new(None, Dma::Normal).await;
+    let log = h.log.clone();
+    Mock::given(method("PUT"))
+        .and(path("/v1/machine:pause"))
+        .respond_with(move |_: &wiremock::Request| {
+            push(&log, Event::Rest("pause"));
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"errors":[]}))
+                .set_delay(Duration::from_secs(1))
+        })
+        .expect(1)
+        .mount(&h.http)
+        .await;
+    h.rest("PUT", "machine:resume", "resume", 200, 1).await;
+    let call = h
+        .send(json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
+            "address": "0",
+        }))
+        .await;
+    h.wait_for(Event::Rest("pause")).await;
+    call.cancel(Some("cancel while pausing".into()))
+        .await
+        .unwrap();
+    h.wait_for(Event::Rest("resume")).await;
+    assert_eq!(h.events(), [Event::Rest("pause"), Event::Rest("resume")]);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn cancelled_transfer_still_resumes() {
+    let h = Harness::new(None, Dma::NoIdentifyReply).await;
+    h.machine(1, 1).await;
+    let call = h
+        .send(json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2])},
+            "address": "0",
+        }))
+        .await;
+    h.wait_for(Event::Identify).await;
+    call.cancel(Some("cancel during transfer".into()))
+        .await
+        .unwrap();
+    h.wait_for(Event::Rest("resume")).await;
+    assert_eq!(
+        h.events(),
+        [
+            Event::Rest("pause"),
+            Event::Connect,
+            Event::Write(0, vec![1, 2]),
+            Event::Identify,
+            Event::Rest("resume"),
+        ]
+    );
     h.finish().await;
 }
 

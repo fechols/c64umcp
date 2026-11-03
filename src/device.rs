@@ -230,9 +230,12 @@ impl Device {
             );
             let mut reply = [0u8];
             async {
-                self.dma(stream.write_all(&dma_frame(DMA_AUTHENTICATE, &[secret])))
-                    .await?;
-                self.dma(stream.read_exact(&mut reply)).await
+                self.dma(
+                    stream.write_all(&dma_frame(DMA_AUTHENTICATE, &[secret])),
+                    false,
+                )
+                .await?;
+                self.dma(stream.read_exact(&mut reply), false).await
             }
             .await
             .context("DMA authentication failed; nothing was written")?;
@@ -243,33 +246,40 @@ impl Device {
         }
         for (address, bytes) in writes {
             let frame = dma_frame(DMA_REU_WRITE, &[&address.to_le_bytes()[..3], bytes]);
-            self.dma(stream.write_all(&frame)).await?;
+            self.dma(stream.write_all(&frame), true).await?;
         }
         // REU writes have no reply. IDENTIFY does, and the device handles
         // commands in order, so its reply confirms that every write is done.
-        self.dma(stream.write_all(&dma_frame(DMA_IDENTIFY, &[])))
+        self.dma(stream.write_all(&dma_frame(DMA_IDENTIFY, &[])), true)
             .await?;
         let mut length = [0u8];
-        self.dma(stream.read_exact(&mut length)).await?;
+        self.dma(stream.read_exact(&mut length), true).await?;
         let mut identity = vec![0u8; usize::from(length[0])];
-        self.dma(stream.read_exact(&mut identity)).await?;
+        self.dma(stream.read_exact(&mut identity), true).await?;
         let _ = tokio::time::timeout(self.timeout, stream.shutdown()).await;
         Ok(())
     }
 
-    async fn dma<T>(&self, operation: impl Future<Output = std::io::Result<T>>) -> Result<T> {
-        match tokio::time::timeout(self.timeout, operation).await {
-            Ok(Ok(value)) => Ok(value),
-            Err(_) => {
-                bail!("C64U DMA transfer timed out; part of the REU range may have been written")
+    /// Bound one socket operation. `writing` says whether REU writes may
+    /// already have been sent, so the error does not claim a partial write
+    /// during authentication.
+    async fn dma<T>(
+        &self,
+        operation: impl Future<Output = std::io::Result<T>>,
+        writing: bool,
+    ) -> Result<T> {
+        let failure = match tokio::time::timeout(self.timeout, operation).await {
+            Ok(Ok(value)) => return Ok(value),
+            Err(_) => "C64U DMA transfer timed out",
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                "C64U DMA service closed the connection (check C64U_PASSWORD)"
             }
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => bail!(
-                "C64U DMA service closed the connection (check C64U_PASSWORD); part of the REU range may have been written"
-            ),
-            Ok(Err(_)) => {
-                bail!("C64U DMA connection failed; part of the REU range may have been written")
-            }
+            Ok(Err(_)) => "C64U DMA connection failed",
+        };
+        if writing {
+            bail!("{failure}; part of the REU range may have been written")
         }
+        bail!("{failure}")
     }
 
     fn request(

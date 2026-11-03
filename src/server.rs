@@ -418,14 +418,14 @@ pub struct ReuRange {
 pub struct UploadReu {
     /// Local or base64 file; device paths are not supported.
     pub source: FileSource,
-    /// Hexadecimal 24-bit REU address, e.g. "0", "$560000", or "0x560000". The written range may not pass $FFFFFF.
+    /// Hexadecimal 24-bit REU address, e.g. "0", "$560000", or "0x560000". The written range may not pass $FFFFFF; it is not checked against the REU size configured on the device.
     pub address: String,
     /// Byte offset of the data within the file; default 0.
     #[serde(default)]
     pub offset: usize,
     /// Bytes to write; default is the rest of the file after offset.
     pub length: Option<usize>,
-    /// Pause the C64 CPU before writing and resume it afterwards, even if the write fails; default true.
+    /// Pause the C64 CPU before writing and resume it afterwards, even if the write fails; default true. The CPU is resumed even if it was already paused before the call; pass false to leave its state alone.
     #[serde(default = "default_true")]
     pub pause: bool,
     /// Range inside the written range that is zeroed before any other write and receives its data last, so a program polling a header there never sees a stale or partial image.
@@ -951,7 +951,7 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Write a local or base64 file (optionally an offset/length slice, up to 16 MiB) into REU memory at a 24-bit hexadecimal address over the Ultimate DMA service (TCP port 64). Pauses the CPU during the write by default and always resumes it. An optional guard range inside the written range is zeroed first and written last. Optional run_prg then resets and runs a PRG.",
+        description = "Write a local or base64 file (optionally an offset/length slice, up to 16 MiB) into REU memory at a 24-bit hexadecimal address over the Ultimate DMA service (TCP port 64). Pauses the CPU during the write by default and always resumes it afterwards, even if it was already paused; use pause=false to leave the CPU state alone. Writes beyond the configured REU size are not detected. An optional guard range inside the written range is zeroed first and written last. Optional run_prg then resets and runs a PRG.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn upload_reu(&self, Parameters(p): Parameters<UploadReu>) -> CallToolResult {
@@ -1005,16 +1005,25 @@ impl C64Server {
                 let guard_chunks = guard.map_or(0, |(_, length)| length.div_ceil(REU_CHUNK));
 
                 let operation_guard = Arc::new(self.gate.clone().lock_owned().await);
-                let mut resume = None;
-                if p.pause {
-                    self.device
+                // Arm the resume before sending the pause: a pause that times
+                // out, or a call cancelled while it is in flight, may still have
+                // paused the CPU. Resuming a running CPU is harmless.
+                let mut resume = p.pause.then(|| ResumeGuard {
+                    device: self.device.clone(),
+                    armed: true,
+                    operation_guard: operation_guard.clone(),
+                });
+                if let Some(guard) = resume.as_mut()
+                    && let Err(pause) = self
+                        .device
                         .json(Method::PUT, "machine:pause", &[], None)
                         .await
-                        .context("could not pause the C64; nothing was written")?;
-                    resume = Some(ResumeGuard {
-                        device: self.device.clone(),
-                        armed: true,
-                        operation_guard: operation_guard.clone(),
+                {
+                    return Err(match guard.resume().await {
+                        Ok(()) => pause.context("could not pause the C64; nothing was written"),
+                        Err(resume) => anyhow::anyhow!(
+                            "could not pause the C64; nothing was written: {pause:#}; resuming the C64 also failed, so it may be paused: {resume:#}"
+                        ),
                     });
                 }
                 let written = self.device.reu_write(&writes).await;

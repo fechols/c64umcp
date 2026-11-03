@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 79 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 76 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -171,8 +171,14 @@ too, and the HTTP timeout applies to each socket operation.
   device answers an IDENTIFY sent behind the last write, so all writes are done.
 - `pause` (default `true`) pauses the CPU first, so a running program cannot
   race the upload with its own REU DMA, and resumes it afterwards, also when the
-  write fails. If the pause fails, nothing is written. If a call is cancelled
-  while paused, the server still tries to resume, with a three-second bound.
+  write fails. If the pause fails, nothing is written and the server still
+  sends a resume, because a timed-out pause may have taken effect. If a call is
+  cancelled while pausing or paused, the server still tries to resume, with a
+  three-second bound. The CPU is resumed even if it was already paused before
+  the call; pass `pause: false` to leave its state alone.
+- The range is checked only against the 24-bit limit, not against the REU size
+  configured on the device. Make sure an REU is enabled and large enough: writes
+  past its size may wrap or be lost while the tool still reports success.
 - `guard` is a range inside the written range. It is zeroed before any other
   write and receives its data last. A program that polls a header or magic
   there never sees a valid one, including a stale one from an earlier upload,
