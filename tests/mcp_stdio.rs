@@ -172,12 +172,13 @@ async fn executable_negotiates_discovers_and_calls_device_with_structured_conten
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(tools.len(), 44, "expected complete tool catalog");
+    assert_eq!(tools.len(), 45, "expected complete tool catalog");
     for name in [
         "get_version",
         "get_info",
         "read_memory",
         "run_prg",
+        "upload_reu",
         "send_input",
         "capture_screenshot",
     ] {

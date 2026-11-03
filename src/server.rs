@@ -1,6 +1,6 @@
 //! Typed MCP tools and shared per-device serialization.
 use crate::{
-    device::{Device, MAX_BODY_BYTES as MAX_FILE},
+    device::{Device, MAX_BODY_BYTES as MAX_FILE, REU_CHUNK, REU_SIZE},
     input, screen, video,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -25,6 +25,8 @@ use tokio::{
 /// handlers release the dispatch lock promptly; this only limits a handler
 /// that rmcp failed to cancel, so the process can still exit.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on resuming the CPU after a cancelled REU upload paused it.
+const RESUME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub struct C64Server {
     device: Device,
@@ -205,6 +207,89 @@ fn memory_range(address: &str, length: usize) -> Result<u16> {
     );
     Ok(address)
 }
+/// Parse a 24-bit hexadecimal REU address whose range must fit in 16 MiB.
+fn reu_range(address: &str, length: usize) -> Result<u32> {
+    let text = address
+        .strip_prefix('$')
+        .or_else(|| address.strip_prefix("0x"))
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(address);
+    ensure!(
+        !text.is_empty() && text.len() <= 6 && text.bytes().all(|b| b.is_ascii_hexdigit()),
+        "REU address must be a 24-bit hexadecimal string"
+    );
+    let address = u32::from_str_radix(text, 16)?;
+    ensure!(
+        length > 0 && length <= REU_SIZE - address as usize,
+        "REU range must be nonempty and may not pass $FFFFFF (16 MiB)"
+    );
+    Ok(address)
+}
+static REU_ZEROS: [u8; REU_CHUNK] = [0; REU_CHUNK];
+fn reu_chunks<'a>(writes: &mut Vec<(u32, &'a [u8])>, address: u32, bytes: &'a [u8]) {
+    for (index, chunk) in bytes.chunks(REU_CHUNK).enumerate() {
+        writes.push((address + (index * REU_CHUNK) as u32, chunk));
+    }
+}
+/// Order REU writes so a guard range (inside the written range) is zeroed
+/// before anything else and receives its data only after everything else.
+fn reu_writes(address: u32, data: &[u8], guard: Option<(u32, usize)>) -> Vec<(u32, &[u8])> {
+    let mut writes = Vec::new();
+    match guard {
+        None => reu_chunks(&mut writes, address, data),
+        Some((guard_address, guard_length)) => {
+            for offset in (0..guard_length).step_by(REU_CHUNK) {
+                let size = REU_CHUNK.min(guard_length - offset);
+                writes.push((guard_address + offset as u32, &REU_ZEROS[..size]));
+            }
+            let start = (guard_address - address) as usize;
+            let end = start + guard_length;
+            reu_chunks(&mut writes, address, &data[..start]);
+            reu_chunks(&mut writes, address + end as u32, &data[end..]);
+            reu_chunks(&mut writes, guard_address, &data[start..end]);
+        }
+    }
+    writes
+}
+/// Resumes the CPU if an REU upload is dropped (cancelled) while it is paused.
+struct ResumeGuard {
+    device: Device,
+    armed: bool,
+    operation_guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+impl ResumeGuard {
+    async fn resume(&mut self) -> Result<()> {
+        let outcome = self
+            .device
+            .json(Method::PUT, "machine:resume", &[], None)
+            .await;
+        self.armed = false;
+        outcome.map(|_| ())
+    }
+}
+impl Drop for ResumeGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let device = self.device.clone();
+            let operation_guard = self.operation_guard.clone();
+            runtime.spawn(async move {
+                let _operation_guard = operation_guard;
+                let resume = device.json(Method::PUT, "machine:resume", &[], None);
+                match tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, resume).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        "resuming the C64 after a cancelled REU upload failed: {error:#}"
+                    ),
+                    Err(_) => tracing::warn!(
+                        "resuming the C64 after a cancelled REU upload timed out; it may still be paused"
+                    ),
+                }
+            });
+        }
+    }
+}
 fn unhex(text: &str) -> Result<Vec<u8>> {
     ensure!(
         text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -320,6 +405,36 @@ pub struct Runner {
     pub songnr: Option<u16>,
     /// Optional second upload for SID song lengths.
     pub song_lengths: Option<FileSource>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReuRange {
+    /// Hexadecimal REU address, e.g. "0", "$560000", or "0x560000".
+    pub address: String,
+    pub length: usize,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UploadReu {
+    /// Local or base64 file; device paths are not supported.
+    pub source: FileSource,
+    /// Hexadecimal 24-bit REU address, e.g. "0", "$560000", or "0x560000". The written range may not pass $FFFFFF.
+    pub address: String,
+    /// Byte offset of the data within the file; default 0.
+    #[serde(default)]
+    pub offset: usize,
+    /// Bytes to write; default is the rest of the file after offset.
+    pub length: Option<usize>,
+    /// Pause the C64 CPU before writing and resume it afterwards, even if the write fails; default true.
+    #[serde(default = "default_true")]
+    pub pause: bool,
+    /// Range inside the written range that is zeroed before any other write and receives its data last, so a program polling a header there never sees a stale or partial image.
+    pub guard: Option<ReuRange>,
+    /// PRG to reset, load and run after the upload and resume, exactly like run_prg.
+    pub run_prg: Option<FileSource>,
+}
+fn default_true() -> bool {
+    true
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -836,6 +951,133 @@ impl C64Server {
         )
     }
     #[tool(
+        description = "Write a local or base64 file (optionally an offset/length slice, up to 16 MiB) into REU memory at a 24-bit hexadecimal address over the Ultimate DMA service (TCP port 64). Pauses the CPU during the write by default and always resumes it. An optional guard range inside the written range is zeroed first and written last. Optional run_prg then resets and runs a PRG.",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    async fn upload_reu(&self, Parameters(p): Parameters<UploadReu>) -> CallToolResult {
+        result(
+            async {
+                // Validate everything and read local files before touching the
+                // device, so no error can leave the CPU paused or the REU half written.
+                let bytes = match p.source.resolve().await? {
+                    ResolvedSource::Upload(_, bytes) => bytes,
+                    ResolvedSource::Remote(_) => {
+                        bail!("REU upload requires a local or base64 source")
+                    }
+                };
+                ensure!(
+                    p.offset < bytes.len(),
+                    "offset must lie within the {}-byte file",
+                    bytes.len()
+                );
+                let available = bytes.len() - p.offset;
+                let length = p.length.unwrap_or(available);
+                ensure!(
+                    length > 0 && length <= available,
+                    "length must be nonzero and fit in the file after offset ({available} bytes)"
+                );
+                let address = reu_range(&p.address, length)?;
+                let data = &bytes[p.offset..p.offset + length];
+                let guard = match p.guard {
+                    None => None,
+                    Some(guard) => {
+                        let guard_address = reu_range(&guard.address, guard.length)?;
+                        ensure!(
+                            guard_address >= address
+                                && guard_address as usize + guard.length
+                                    <= address as usize + length,
+                            "guard range must lie inside the written REU range"
+                        );
+                        Some((guard_address, guard.length))
+                    }
+                };
+                let program = match p.run_prg {
+                    None => None,
+                    Some(source) => {
+                        let source = source.resolve().await?;
+                        if let ResolvedSource::Upload(_, ref bytes) = source {
+                            validate_prg(bytes)?;
+                        }
+                        Some(source)
+                    }
+                };
+                let writes = reu_writes(address, data, guard);
+                let guard_chunks = guard.map_or(0, |(_, length)| length.div_ceil(REU_CHUNK));
+
+                let operation_guard = Arc::new(self.gate.clone().lock_owned().await);
+                let mut resume = None;
+                if p.pause {
+                    self.device
+                        .json(Method::PUT, "machine:pause", &[], None)
+                        .await
+                        .context("could not pause the C64; nothing was written")?;
+                    resume = Some(ResumeGuard {
+                        device: self.device.clone(),
+                        armed: true,
+                        operation_guard: operation_guard.clone(),
+                    });
+                }
+                let written = self.device.reu_write(&writes).await;
+                let resumed = match resume.as_mut() {
+                    Some(guard) => Some(guard.resume().await),
+                    None => None,
+                };
+                match (written, resumed) {
+                    (Err(write), Some(Err(resume))) => bail!(
+                        "{write:#}; resuming the C64 also failed, so it may still be paused: {resume:#}"
+                    ),
+                    (Err(write), Some(Ok(()))) => {
+                        return Err(write.context("REU upload failed; the C64 was resumed"));
+                    }
+                    (Err(write), None) => return Err(write.context("REU upload failed")),
+                    (Ok(()), Some(Err(resume))) => {
+                        return Err(resume.context(
+                            "REU upload completed, but resuming the C64 failed; it may still be paused",
+                        ));
+                    }
+                    (Ok(()), _) => {}
+                }
+                let ran = match program {
+                    None => false,
+                    Some(program) => {
+                        match program {
+                            ResolvedSource::Remote(path) => {
+                                self.device
+                                    .json(
+                                        Method::PUT,
+                                        "runners:run_prg",
+                                        &[("file".into(), path)],
+                                        None,
+                                    )
+                                    .await
+                            }
+                            ResolvedSource::Upload(name, bytes) => {
+                                self.device
+                                    .upload("runners:run_prg", &[], vec![(name, bytes)])
+                                    .await
+                            }
+                        }
+                        .context("REU upload completed, but run_prg failed")?;
+                        true
+                    }
+                };
+                Ok(json!({
+                    "address": format!("{address:06X}"),
+                    "bytes_written": length,
+                    "chunks": writes.len() - guard_chunks,
+                    "guard": guard.map(|(guard_address, guard_length)| json!({
+                        "address": format!("{guard_address:06X}"),
+                        "length": guard_length,
+                        "zero_chunks": guard_chunks,
+                    })),
+                    "paused": p.pause,
+                    "ran": ran,
+                }))
+            }
+            .await,
+        )
+    }
+    #[tool(
         description = "Write a hexadecimal byte to the U64 debug register and return its readback.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
@@ -1185,6 +1427,60 @@ mod tests {
         let bytes: Vec<u8> = (0..=255).collect();
         assert_eq!(unhex(&hex(&bytes)).unwrap(), bytes);
         assert_eq!(hex(&[0x0a, 0xff]), "0AFF");
+    }
+
+    #[test]
+    fn reu_range_accepts_24_bit_addresses_within_16_mib() {
+        assert_eq!(reu_range("0", 1).unwrap(), 0);
+        assert_eq!(reu_range("$560000", 16).unwrap(), 0x560000);
+        assert_eq!(reu_range("0xFFFFFF", 1).unwrap(), 0xFFFFFF);
+        assert_eq!(reu_range("0", REU_SIZE).unwrap(), 0);
+        for (address, length) in [
+            ("1000000", 1),
+            ("FFFFFF", 2),
+            ("1", REU_SIZE),
+            ("0", 0),
+            ("", 1),
+            ("$", 1),
+            ("12G", 1),
+        ] {
+            assert!(
+                reu_range(address, length).is_err(),
+                "{address}/{length} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reu_writes_zero_the_guard_first_and_write_it_last() {
+        let data: Vec<u8> = (0..70000u32).map(|i| i as u8).collect();
+        let plain = reu_writes(0x560000, &data, None);
+        assert_eq!(
+            plain.iter().map(|(a, b)| (*a, b.len())).collect::<Vec<_>>(),
+            [(0x560000, 32768), (0x568000, 32768), (0x570000, 4464)]
+        );
+        let guarded = reu_writes(0x560000, &data, Some((0x560010, 40000)));
+        assert_eq!(
+            guarded
+                .iter()
+                .map(|(a, b)| (*a, b.len()))
+                .collect::<Vec<_>>(),
+            [
+                (0x560010, 32768),
+                (0x568010, 7232),
+                (0x560000, 16),
+                (0x569C50, 29984),
+                (0x560010, 32768),
+                (0x568010, 7232),
+            ]
+        );
+        assert!(guarded[..2].iter().all(|(_, b)| b.iter().all(|&x| x == 0)));
+        let mut image = vec![0xEEu8; data.len()];
+        for (address, bytes) in &guarded[2..] {
+            let start = (*address - 0x560000) as usize;
+            image[start..start + bytes.len()].copy_from_slice(bytes);
+        }
+        assert_eq!(image, data);
     }
 
     #[tokio::test]

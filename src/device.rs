@@ -1,17 +1,31 @@
 //! Bounded, authenticated access to one configured Ultimate REST API.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use reqwest::{
     Client, Method, RequestBuilder, Response, StatusCode, Url,
     header::{CONTENT_TYPE, HeaderMap, HeaderValue},
     multipart::{Form, Part},
 };
 use serde_json::Value;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 /// Applies to response bodies and uploaded request payloads.
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// The Ultimate's DMA service listens on this TCP port of the REST host.
+pub const DMA_PORT: u16 = 64;
+/// REU addresses are 24-bit: the largest RAM Expansion Unit is 16 MiB.
+pub const REU_SIZE: usize = 16 * 1024 * 1024;
+/// Largest data payload of one DMA REU write command.
+pub const REU_CHUNK: usize = 32 * 1024;
+
+const DMA_REU_WRITE: u16 = 0xff07;
+const DMA_IDENTIFY: u16 = 0xff0e;
+const DMA_AUTHENTICATE: u16 = 0xff1f;
 
 /// Clones share the HTTP connection pool; no connection is made at construction.
 #[derive(Clone)]
@@ -19,6 +33,8 @@ pub struct Device {
     client: Client,
     base: Option<Url>,
     password: Option<Arc<str>>,
+    timeout: Duration,
+    dma_port: u16,
 }
 
 impl Device {
@@ -49,7 +65,16 @@ impl Device {
             client,
             base,
             password: password.map(Arc::from),
+            timeout,
+            dma_port: DMA_PORT,
         })
+    }
+
+    /// Use another TCP port for the DMA service; intended for loopback tests.
+    #[doc(hidden)]
+    pub fn with_dma_port(mut self, port: u16) -> Self {
+        self.dma_port = port;
+        self
     }
 
     /// Normalized API root, ending in `/v1/`.
@@ -164,17 +189,96 @@ impl Device {
         self.json_response(request).await
     }
 
+    /// Write `(REU address, bytes)` blocks to REU memory over the DMA service
+    /// socket, in order, each at most [`REU_CHUNK`] bytes. Returns after the
+    /// device answers an IDENTIFY sent behind the last write, so every write
+    /// has been processed. A configured password authenticates the socket.
+    pub async fn reu_write(&self, writes: &[(u32, &[u8])]) -> Result<()> {
+        let base = self.base.as_ref().ok_or_else(no_host)?;
+        for (address, bytes) in writes {
+            ensure!(
+                !bytes.is_empty()
+                    && bytes.len() <= REU_CHUNK
+                    && *address as usize + bytes.len() <= REU_SIZE,
+                "Invalid REU write block"
+            );
+        }
+        let host = match base.host() {
+            Some(url::Host::Domain(name)) => name.to_owned(),
+            Some(url::Host::Ipv4(address)) => address.to_string(),
+            Some(url::Host::Ipv6(address)) => address.to_string(),
+            None => bail!("C64U URL must contain a host"),
+        };
+        let port = self.dma_port;
+        let mut stream =
+            tokio::time::timeout(self.timeout, TcpStream::connect((host.as_str(), port)))
+                .await
+                .map_err(|_| {
+                    anyhow!("Timed out connecting to the C64U DMA service (TCP port {port})")
+                })?
+                .map_err(|_| {
+                    anyhow!(
+                        "Could not connect to the C64U DMA service (TCP port {port}); enable the Ultimate DMA Service in the device's network settings"
+                    )
+                })?;
+        let _ = stream.set_nodelay(true);
+        if let Some(password) = &self.password {
+            let secret = password.as_bytes();
+            ensure!(
+                secret.len() <= usize::from(u16::MAX),
+                "C64U_PASSWORD is too long for the DMA service"
+            );
+            let mut reply = [0u8];
+            async {
+                self.dma(stream.write_all(&dma_frame(DMA_AUTHENTICATE, &[secret])))
+                    .await?;
+                self.dma(stream.read_exact(&mut reply)).await
+            }
+            .await
+            .context("DMA authentication failed; nothing was written")?;
+            ensure!(
+                reply[0] == 1,
+                "DMA authentication refused; check C64U_PASSWORD. Nothing was written"
+            );
+        }
+        for (address, bytes) in writes {
+            let frame = dma_frame(DMA_REU_WRITE, &[&address.to_le_bytes()[..3], bytes]);
+            self.dma(stream.write_all(&frame)).await?;
+        }
+        // REU writes have no reply. IDENTIFY does, and the device handles
+        // commands in order, so its reply confirms that every write is done.
+        self.dma(stream.write_all(&dma_frame(DMA_IDENTIFY, &[])))
+            .await?;
+        let mut length = [0u8];
+        self.dma(stream.read_exact(&mut length)).await?;
+        let mut identity = vec![0u8; usize::from(length[0])];
+        self.dma(stream.read_exact(&mut identity)).await?;
+        let _ = tokio::time::timeout(self.timeout, stream.shutdown()).await;
+        Ok(())
+    }
+
+    async fn dma<T>(&self, operation: impl Future<Output = std::io::Result<T>>) -> Result<T> {
+        match tokio::time::timeout(self.timeout, operation).await {
+            Ok(Ok(value)) => Ok(value),
+            Err(_) => {
+                bail!("C64U DMA transfer timed out; part of the REU range may have been written")
+            }
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => bail!(
+                "C64U DMA service closed the connection (check C64U_PASSWORD); part of the REU range may have been written"
+            ),
+            Ok(Err(_)) => {
+                bail!("C64U DMA connection failed; part of the REU range may have been written")
+            }
+        }
+    }
+
     fn request(
         &self,
         method: Method,
         route: &str,
         query: &[(String, String)],
     ) -> Result<RequestBuilder> {
-        let base = self.base.as_ref().ok_or_else(|| {
-            anyhow!(
-                "No C64U host configured; set C64U_HOST or pass --host before using device tools"
-            )
-        })?;
+        let base = self.base.as_ref().ok_or_else(no_host)?;
         ensure!(
             !route.is_empty()
                 && !route.starts_with('/')
@@ -272,6 +376,23 @@ impl Device {
                 .collect(),
         )
     }
+}
+
+fn no_host() -> anyhow::Error {
+    anyhow!("No C64U host configured; set C64U_HOST or pass --host before using device tools")
+}
+
+/// A DMA command: little-endian command word and payload length, then payload.
+fn dma_frame(command: u16, payload: &[&[u8]]) -> Vec<u8> {
+    let length: usize = payload.iter().map(|part| part.len()).sum();
+    debug_assert!(length <= usize::from(u16::MAX));
+    let mut frame = Vec::with_capacity(4 + length);
+    frame.extend_from_slice(&command.to_le_bytes());
+    frame.extend_from_slice(&(length as u16).to_le_bytes());
+    for part in payload {
+        frame.extend_from_slice(part);
+    }
+    frame
 }
 
 fn normalize_host(host: &str) -> Result<Url> {

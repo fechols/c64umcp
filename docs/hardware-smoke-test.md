@@ -30,6 +30,9 @@ Use a disposable session with no unsaved program or disk work.
    Confirm one command and expected output; tune hold_ms/gap_ms if necessary.
 4. Exercise a raw key tap and release_all_inputs.
 5. Pause and resume the scratch program; always resume after the check.
+   With the Ultimate DMA Service enabled and an REU configured, call upload_reu
+   with a small local file at a scratch REU address (e.g. {"address":"FF0000"});
+   confirm the C64 resumed. upload_reu uses TCP port 64, not the REST port.
 6. If desired, mount a disposable image in readonly mode, verify list_drives,
    then eject it. Test writes only with a scratch image explicitly intended for
    modification.

@@ -1,10 +1,10 @@
 # c64umcp
 
 A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
-Runs locally over **stdio**, with 44 typed tools for programs, drives, configuration,
-memory, input, and screenshots. One device per process.
+Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
+memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 67 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 79 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -69,7 +69,7 @@ query strings, fragments, or arbitrary URL paths. LAN requests bypass system pro
 | Programs/music | `load_prg`, `run_prg`, `run_crt`, `play_sid`, `play_mod` |
 | Configuration | `list_config_categories`, `get_config`, `set_config`, `set_config_batch`, `load_config_from_flash`, `save_config_to_flash`, `reset_config_defaults` |
 | Machine | `reset_machine`, `reboot_machine`, `pause_machine`, `resume_machine`, `poweroff_machine`, `toggle_menu` |
-| Memory/debug | `read_memory`, `write_memory`, `read_debug_register`, `write_debug_register` |
+| Memory/debug | `read_memory`, `write_memory`, `upload_reu`, `read_debug_register`, `write_debug_register` |
 | Drives | `list_drives`, `mount_disk`, `eject_disk`, `unlink_disk`, `reset_drive`, `enable_drive`, `disable_drive`, `load_drive_rom`, `set_drive_mode` |
 | Files | `file_info`, `create_disk_image` |
 | Input | `get_input_state`, `send_input`, `release_all_inputs`, `type_text` |
@@ -146,6 +146,43 @@ save to flash. Batch updates may partially apply before an error.
 optional `diskname`, and `tracks`: D64 defaults to 35 and accepts 35/40;
 DNP requires 1–255; D71/D81 have fixed counts. Creation may overwrite existing files.
 There is no general REST directory browser, file transfer, or deletion tool.
+
+### REU uploads
+
+```json
+{
+  "source":{"kind":"local","path":"C:/build/image.bin"},
+  "address":"$560000",
+  "guard":{"address":"$560000","length":16},
+  "run_prg":{"kind":"local","path":"C:/build/start.prg"}
+}
+```
+
+`upload_reu` writes a local or base64 file into REU (RAM Expansion Unit) memory.
+REST `writemem` only reaches C64 RAM, so this tool uses the Ultimate's **DMA
+service**: TCP port 64 on the configured host. Enable that service in the
+device's network settings. `C64U_PASSWORD`, if set, authenticates the socket
+too, and the HTTP timeout applies to each socket operation.
+
+- `address` is a 24-bit hexadecimal REU address; `address + length` may not
+  pass 16 MiB. Optional `offset` and `length` select a slice of the file
+  (default: all of it). Files follow the usual 32 MiB upload limit.
+- Data goes in writes of at most 32 KiB. The tool returns only after the
+  device answers an IDENTIFY sent behind the last write, so all writes are done.
+- `pause` (default `true`) pauses the CPU first, so a running program cannot
+  race the upload with its own REU DMA, and resumes it afterwards, also when the
+  write fails. If the pause fails, nothing is written. If a call is cancelled
+  while paused, the server still tries to resume, with a three-second bound.
+- `guard` is a range inside the written range. It is zeroed before any other
+  write and receives its data last. A program that polls a header or magic
+  there never sees a valid one, including a stale one from an earlier upload,
+  before the whole image has arrived.
+- `run_prg` (device, local or base64, validated like `run_prg`) resets and runs
+  a PRG after the upload and resume; it is skipped if the upload fails.
+
+The result reports `address`, `bytes_written`, `chunks` (data writes),
+`guard` (with its `zero_chunks`) or null, `paused`, and `ran`.
+A failure during the transfer can leave part of the range written.
 
 ### Keyboard, joystick and text
 
