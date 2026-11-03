@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 84 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 87 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -93,7 +93,8 @@ another lock directory, or the same device configured under another
 hostname or address; other tools are serialized per process only.
 Annotations describe effects; they are not a separate permission system.
 On a normal MCP stdin close, the server waits (up to 10 seconds) for active
-handlers and bounded keyboard/video cleanup before exiting.
+handlers and bounded keyboard/video cleanup, then releases inputs it still
+holds, before exiting.
 
 ### Program and disk sources
 
@@ -225,6 +226,10 @@ A failure during the transfer can leave part of the range written.
 
 `send_input` accepts 1–64 events and at most 4096 serialized bytes.
 Transitions are `press`, `release`, `tap`. Held inputs persist until released.
+The server remembers which inputs it pressed (counting a press whose response
+was lost or cancelled) and, on a clean shutdown, releases exactly those, with
+a three-second bound; it never sends `release_all` then, so another client's
+held inputs stay pressed. `release_all_inputs` clears that record.
 Keyboard chords allow 1–8 unique documented key names. `restore` must be alone
 and tapped. Joystick ports are 1/2; inputs are up/down/left/right/fire/fire2/fire3.
 
@@ -232,7 +237,9 @@ and tapped. Joystick ports are 1/2; inputs are up/down/left/right/fire/fire2/fir
 range 1–1000), and at most 1000 characters. It validates all text first, then
 presses/releases one chord at a time. Letters use unshifted physical C64 keys:
 on the usual uppercase/graphics screen they appear uppercase; menu/lowercase
-modes differ. CRLF becomes one Return.
+modes differ. CRLF becomes one Return. Keys held through `send_input` before
+the call (a Shift, say) are pressed with each chord but not released, so they
+stay held afterwards.
 
 Supported punctuation: `+ - . : @ , * ; = / ! " # $ % & ' ( ) ? < > [ ]`,
 plus digits, spaces and newlines. Other characters are rejected.

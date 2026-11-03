@@ -128,6 +128,88 @@ pub fn validate_events(events: &[InputEvent]) -> Result<Value> {
     Ok(body)
 }
 
+/// A held input: joystick port (0 for the keyboard) and input name.
+pub type HeldInput = (u8, String);
+
+/// Every input that a batch presses, recorded before it is sent: a lost
+/// response may still have pressed it.
+pub fn pressed(events: &[InputEvent]) -> Vec<HeldInput> {
+    let mut inputs = Vec::new();
+    for event in events {
+        match event {
+            InputEvent::Keyboard {
+                inputs: names,
+                transition: Transition::Press,
+            } => inputs.extend(names.iter().map(|name| (0, name.clone()))),
+            InputEvent::Joystick {
+                port,
+                inputs: names,
+                transition: Transition::Press,
+            } => inputs.extend(names.iter().map(|name| (*port, name.clone()))),
+            _ => {}
+        }
+    }
+    inputs
+}
+
+/// Update the held set after the device accepted a batch.
+pub fn apply(held: &mut HashSet<HeldInput>, events: &[InputEvent]) {
+    for event in events {
+        let (port, names, transition) = match event {
+            InputEvent::Keyboard { inputs, transition } => (0, inputs, *transition),
+            InputEvent::Joystick {
+                port,
+                inputs,
+                transition,
+            } => (*port, inputs, *transition),
+            InputEvent::ReleaseAll {} => {
+                held.clear();
+                continue;
+            }
+        };
+        for name in names {
+            let key = (port, name.clone());
+            if transition == Transition::Press {
+                held.insert(key);
+            } else {
+                held.remove(&key);
+            }
+        }
+    }
+}
+
+/// Request bodies releasing exactly `held`, and nothing another client holds.
+pub fn release_bodies(held: &HashSet<HeldInput>) -> Vec<Value> {
+    let mut sorted: Vec<_> = held.iter().collect();
+    sorted.sort();
+    let mut events = Vec::new();
+    for port in 0..=2u8 {
+        let names: Vec<String> = sorted
+            .iter()
+            .filter(|(p, _)| *p == port)
+            .map(|(_, name)| name.clone())
+            .collect();
+        for chunk in names.chunks(if port == 0 { 8 } else { 7 }) {
+            events.push(if port == 0 {
+                InputEvent::Keyboard {
+                    inputs: chunk.to_vec(),
+                    transition: Transition::Release,
+                }
+            } else {
+                InputEvent::Joystick {
+                    port,
+                    inputs: chunk.to_vec(),
+                    transition: Transition::Release,
+                }
+            });
+        }
+    }
+    events
+        .chunks(16)
+        .filter_map(|batch| validate_events(batch).ok())
+        .collect()
+}
+
 /// Map the supported ASCII subset to physical C64 chords. Letter case folds to
 /// unshifted keys: these produce uppercase on the default uppercase/graphics screen.
 /// CR, LF and CRLF map to RETURN. Unsupported characters are rejected up front.
@@ -264,11 +346,14 @@ impl Drop for KeyReleaseGuard {
 }
 
 /// Caller must serialize the entire operation against other machine operations.
+/// Keys in `held` (pressed earlier by the caller, such as a modifier) are
+/// pressed with each chord as usual but never released.
 pub async fn type_text(
     device: &Device,
     text: &str,
     hold_ms: u64,
     gap_ms: u64,
+    held: &HashSet<String>,
     operation_guard: Option<Arc<OperationGuard>>,
 ) -> Result<Value> {
     let chords = text_to_keys(text)?;
@@ -288,8 +373,13 @@ pub async fn type_text(
     };
     let mut completed = 0;
     for chord in &chords {
+        let release: Vec<String> = chord
+            .iter()
+            .filter(|key| !held.contains(*key))
+            .cloned()
+            .collect();
         // Mark before sending: even a failed response may have applied the press.
-        guard.active = Some(chord.clone());
+        guard.active = (!release.is_empty()).then_some(release);
         let result = async {
             send_chord(device, chord, Transition::Press).await?;
             tokio::time::sleep(Duration::from_millis(hold_ms)).await;
@@ -435,8 +525,14 @@ mod tests {
             .mount(&server)
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(2)).unwrap();
-        assert!(type_text(&device, "A🙂", 1, 1, None).await.is_err());
-        let result = type_text(&device, "a?", 1, 1, None).await.unwrap();
+        assert!(
+            type_text(&device, "A🙂", 1, 1, &HashSet::new(), None)
+                .await
+                .is_err()
+        );
+        let result = type_text(&device, "a?", 1, 1, &HashSet::new(), None)
+            .await
+            .unwrap();
         assert_eq!(result["characters_typed"], 2);
         let requests = server.received_requests().await.unwrap();
         let events: Vec<Value> = requests
@@ -452,6 +548,68 @@ mod tests {
         );
         assert_eq!(events[0]["inputs"], json!(["a"]));
         assert_eq!(events[2]["inputs"], json!(["left_shift", "slash"]));
+    }
+
+    #[tokio::test]
+    async fn typing_keeps_keys_the_caller_already_holds() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/machine:input"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"errors":[]})))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let device = Device::new(Some(&server.uri()), None, Duration::from_secs(2)).unwrap();
+        let held = HashSet::from(["left_shift".to_string(), "b".to_string()]);
+        type_text(&device, "!b", 1, 1, &held, None).await.unwrap();
+        let events: Vec<Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<Value>().unwrap()["events"][0].clone())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                json!({"kind":"keyboard","inputs":["left_shift","1"],"transition":"press"}),
+                json!({"kind":"keyboard","inputs":["1"],"transition":"release"}),
+                json!({"kind":"keyboard","inputs":["b"],"transition":"press"}),
+            ]
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn held_inputs_follow_presses_releases_and_release_all() {
+        let events: Vec<InputEvent> = serde_json::from_value(json!([
+            {"kind":"joystick","port":2,"inputs":["up","fire"],"transition":"press"},
+            {"kind":"keyboard","inputs":["left_shift","a"],"transition":"press"},
+            {"kind":"keyboard","inputs":["a"],"transition":"release"},
+            {"kind":"joystick","port":2,"inputs":["up"],"transition":"tap"},
+        ]))
+        .unwrap();
+        assert_eq!(pressed(&events).len(), 4);
+        let mut held = HashSet::new();
+        apply(&mut held, &events);
+        assert_eq!(
+            held,
+            HashSet::from([(2, "fire".to_string()), (0, "left_shift".to_string())])
+        );
+        assert_eq!(
+            release_bodies(&held),
+            [json!({"events":[
+                {"kind":"keyboard","inputs":["left_shift"],"transition":"release"},
+                {"kind":"joystick","port":2,"inputs":["fire"],"transition":"release"},
+            ]})]
+        );
+        apply(&mut held, &[InputEvent::ReleaseAll {}]);
+        assert!(held.is_empty());
+        assert!(release_bodies(&held).is_empty());
     }
 
     #[tokio::test]
@@ -471,7 +629,7 @@ mod tests {
             .mount(&server)
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(2)).unwrap();
-        let error = type_text(&device, "abc", 1, 1, None)
+        let error = type_text(&device, "abc", 1, 1, &HashSet::new(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -512,8 +670,9 @@ mod tests {
         let guard = Arc::new(OperationGuard::gate_only(
             operation_lock.clone().lock_owned().await,
         ));
-        let typing =
-            tokio::spawn(async move { type_text(&device, "ab", 1000, 1, Some(guard)).await });
+        let typing = tokio::spawn(async move {
+            type_text(&device, "ab", 1000, 1, &HashSet::new(), Some(guard)).await
+        });
         tokio::time::timeout(Duration::from_secs(2), pressed.notified())
             .await
             .unwrap();
@@ -548,7 +707,7 @@ mod tests {
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(10)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
-        let error = type_text(&device, "A", 1, 1, Some(guard))
+        let error = type_text(&device, "A", 1, 1, &HashSet::new(), Some(guard))
             .await
             .unwrap_err()
             .to_string();
@@ -583,7 +742,7 @@ mod tests {
         let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            type_text(&device, "A", 1, 1, Some(guard)),
+            type_text(&device, "A", 1, 1, &HashSet::new(), Some(guard)),
         )
         .await
         .expect("cleanup must finish before the HTTP timeout")
@@ -619,7 +778,9 @@ mod tests {
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(15)).unwrap();
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         let guard = Arc::new(OperationGuard::gate_only(lock.clone().lock_owned().await));
-        let typing = tokio::spawn(async move { type_text(&device, "A", 1, 1, Some(guard)).await });
+        let typing = tokio::spawn(async move {
+            type_text(&device, "A", 1, 1, &HashSet::new(), Some(guard)).await
+        });
         tokio::time::timeout(Duration::from_secs(2), cleanup_started.notified())
             .await
             .unwrap();

@@ -18,6 +18,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -43,6 +44,9 @@ pub struct C64Server {
     /// Destination of the video stream this server started with start_stream;
     /// a screenshot sends video back there instead of stopping it.
     video_stream: Arc<std::sync::Mutex<Option<String>>>,
+    /// Inputs this server pressed with send_input and has not released; the
+    /// server releases exactly these on shutdown.
+    held: Arc<std::sync::Mutex<HashSet<input::HeldInput>>>,
     accepting_calls: Arc<RwLock<bool>>,
     capture_ip: Option<Ipv4Addr>,
     capture_port: u16,
@@ -61,6 +65,7 @@ impl C64Server {
             gate: Arc::new(Mutex::new(())),
             device_lock: None,
             video_stream: Arc::default(),
+            held: Arc::default(),
             accepting_calls: Arc::new(RwLock::new(true)),
             capture_ip,
             capture_port,
@@ -102,13 +107,42 @@ impl C64Server {
             *accepting_calls = false;
             // Input/video cancellation transfers this lock to bounded cleanup
             // tasks before dispatch returns. Acquiring it joins that cleanup too.
-            let _device_idle = self.gate.lock().await;
+            self.gate.lock().await
         })
         .await;
         if joined.is_err() {
             tracing::warn!(
                 "shutdown did not join in-flight device operations within {SHUTDOWN_JOIN_TIMEOUT:?}; exiting anyway"
             );
+        }
+        // Holding the gate when joined; otherwise best effort without it.
+        let _device_idle = joined.ok();
+        self.release_held_inputs().await;
+    }
+
+    /// Release the inputs this server still holds, and only those: another
+    /// client's inputs stay pressed. Bounded by the cleanup timeout.
+    async fn release_held_inputs(&self) {
+        let held = std::mem::take(&mut *self.held.lock().unwrap());
+        if held.is_empty() {
+            return;
+        }
+        let release = async {
+            for body in input::release_bodies(&held) {
+                self.device
+                    .json(Method::POST, "machine:input", &[], Some(body))
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, release).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("releasing held inputs at shutdown failed: {error:#}")
+            }
+            Err(_) => tracing::warn!(
+                "releasing held inputs at shutdown timed out; they may remain pressed"
+            ),
         }
     }
 
@@ -1357,26 +1391,42 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn send_input(&self, Parameters(p): Parameters<InputEvents>) -> CallToolResult {
-        match input::validate_events(&p.events) {
-            Ok(body) => {
-                self.request(Method::POST, "machine:input", vec![], Some(body))
-                    .await
-            }
-            Err(e) => result(Err(e)),
+        let body = match input::validate_events(&p.events) {
+            Ok(body) => body,
+            Err(e) => return result(Err(e)),
+        };
+        let _guard = self.gate.lock().await;
+        // Record presses before sending: a lost or cancelled response may
+        // still have pressed them, and shutdown must release them.
+        self.held.lock().unwrap().extend(input::pressed(&p.events));
+        let sent = self
+            .device
+            .json(Method::POST, "machine:input", &[], Some(body))
+            .await;
+        if sent.is_ok() {
+            input::apply(&mut self.held.lock().unwrap(), &p.events);
         }
+        result(sent)
     }
     #[tool(
         description = "Release all REST-injected keyboard and joystick inputs.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn release_all_inputs(&self) -> CallToolResult {
-        self.request(
-            Method::POST,
-            "machine:input",
-            vec![],
-            Some(json!({"events":[{"kind":"release_all"}]})),
-        )
-        .await
+        let _guard = self.gate.lock().await;
+        let sent = self
+            .device
+            .json(
+                Method::POST,
+                "machine:input",
+                &[],
+                Some(json!({"events":[{"kind":"release_all"}]})),
+            )
+            .await;
+        if sent.is_ok() {
+            self.held.lock().unwrap().clear();
+        }
+        result(sent)
     }
     #[tool(
         description = "Type supported ASCII using paced physical C64 keys, default 50 ms held/50 ms gap. Letter case folds to unshifted keys; use raw events for exact modifiers. Firmware-dependent; no RAM fallback.",
@@ -1387,7 +1437,26 @@ impl C64Server {
             Ok(guard) => Arc::new(guard),
             Err(error) => return result(Err(error)),
         };
-        result(input::type_text(&self.device, &p.text, p.hold_ms, p.gap_ms, Some(guard)).await)
+        // Keys the caller holds (a modifier, say) must stay held after typing.
+        let held: HashSet<String> = self
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(port, _)| *port == 0)
+            .map(|(_, name)| name.clone())
+            .collect();
+        result(
+            input::type_text(
+                &self.device,
+                &p.text,
+                p.hold_ms,
+                p.gap_ms,
+                &held,
+                Some(guard),
+            )
+            .await,
+        )
     }
     #[tool(
         description = "Read and decode the 40x25 firmware menu screen. A 404 can mean the menu is closed; firmware-dependent.",

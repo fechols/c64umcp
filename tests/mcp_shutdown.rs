@@ -236,3 +236,43 @@ async fn stdin_eof_releases_inflight_key_press_before_exit() {
     );
     mock.verify().await;
 }
+
+#[tokio::test]
+async fn stdin_eof_releases_inputs_this_server_holds() {
+    let mock = MockServer::start().await;
+    let released = Arc::new(Mutex::new(Vec::new()));
+    let record = released.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/machine:input"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = request.body_json::<Value>().unwrap();
+            if body["events"][0]["transition"] == "release" {
+                record.lock().unwrap().push(body);
+            }
+            ResponseTemplate::new(200).set_body_json(json!({"errors":[]}))
+        })
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let mut server = StdioServer::start(&mock).await;
+    server
+        .call(
+            "send_input",
+            json!({"events":[{"kind":"joystick","port":2,"inputs":["fire"],"transition":"press"}]}),
+        )
+        .await;
+    let line = timeout(WAIT, server.stdout.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], 2);
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    server.close_stdin_and_wait().await;
+    assert_eq!(
+        *released.lock().unwrap(),
+        [json!({"events":[{"kind":"joystick","port":2,"inputs":["fire"],"transition":"release"}]})]
+    );
+    mock.verify().await;
+}
