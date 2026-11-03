@@ -23,6 +23,10 @@ pub const REU_SIZE: usize = 16 * 1024 * 1024;
 /// Largest data payload of one DMA REU write command.
 pub const REU_CHUNK: usize = 32 * 1024;
 
+/// Bound on the IDENTIFY probe sent before any write: a busy or dead DMA
+/// service should fail fast, while nothing has been written yet.
+const DMA_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 const DMA_REU_WRITE: u16 = 0xff07;
 const DMA_IDENTIFY: u16 = 0xff0e;
 const DMA_AUTHENTICATE: u16 = 0xff1f;
@@ -190,9 +194,11 @@ impl Device {
     }
 
     /// Write `(REU address, bytes)` blocks to REU memory over the DMA service
-    /// socket, in order, each at most [`REU_CHUNK`] bytes. Returns after the
-    /// device answers an IDENTIFY sent behind the last write, so every write
-    /// has been processed. A configured password authenticates the socket.
+    /// socket, in order, each at most [`REU_CHUNK`] bytes. A configured
+    /// password authenticates the socket, and an IDENTIFY probe with a short
+    /// bound checks that the service answers before anything is written.
+    /// Returns after the device answers an IDENTIFY sent behind the last
+    /// write, so every write has been processed.
     pub async fn reu_write(&self, writes: &[(u32, &[u8])]) -> Result<()> {
         let base = self.base.as_ref().ok_or_else(no_host)?;
         for (address, bytes) in writes {
@@ -214,11 +220,13 @@ impl Device {
             tokio::time::timeout(self.timeout, TcpStream::connect((host.as_str(), port)))
                 .await
                 .map_err(|_| {
-                    anyhow!("Timed out connecting to the C64U DMA service (TCP port {port})")
+                    anyhow!(
+                        "Timed out connecting to the C64U DMA service (TCP port {port}); nothing was written"
+                    )
                 })?
                 .map_err(|_| {
                     anyhow!(
-                        "Could not connect to the C64U DMA service (TCP port {port}); enable the Ultimate DMA Service in the device's network settings"
+                        "Could not connect to the C64U DMA service (TCP port {port}); enable the Ultimate DMA Service in the device's network settings. Nothing was written"
                     )
                 })?;
         let _ = stream.set_nodelay(true);
@@ -232,10 +240,12 @@ impl Device {
             async {
                 self.dma(
                     stream.write_all(&dma_frame(DMA_AUTHENTICATE, &[secret])),
-                    false,
+                    Phase::Auth,
+                    self.timeout,
                 )
                 .await?;
-                self.dma(stream.read_exact(&mut reply), false).await
+                self.dma(stream.read_exact(&mut reply), Phase::Auth, self.timeout)
+                    .await
             }
             .await
             .context("DMA authentication failed; nothing was written")?;
@@ -244,42 +254,73 @@ impl Device {
                 "DMA authentication refused; check C64U_PASSWORD. Nothing was written"
             );
         }
+        // A busy or dead service fails here, before anything is written.
+        self.identify(
+            &mut stream,
+            Phase::Probe,
+            DMA_PROBE_TIMEOUT.min(self.timeout),
+        )
+        .await?;
         for (address, bytes) in writes {
             let frame = dma_frame(DMA_REU_WRITE, &[&address.to_le_bytes()[..3], bytes]);
-            self.dma(stream.write_all(&frame), true).await?;
+            self.dma(stream.write_all(&frame), Phase::Write, self.timeout)
+                .await?;
         }
         // REU writes have no reply. IDENTIFY does, and the device handles
         // commands in order, so its reply confirms that every write is done.
-        self.dma(stream.write_all(&dma_frame(DMA_IDENTIFY, &[])), true)
+        self.identify(&mut stream, Phase::Identify, self.timeout)
             .await?;
-        let mut length = [0u8];
-        self.dma(stream.read_exact(&mut length), true).await?;
-        let mut identity = vec![0u8; usize::from(length[0])];
-        self.dma(stream.read_exact(&mut identity), true).await?;
         let _ = tokio::time::timeout(self.timeout, stream.shutdown()).await;
         Ok(())
     }
 
-    /// Bound one socket operation. `writing` says whether REU writes may
-    /// already have been sent, so the error does not claim a partial write
-    /// during authentication.
+    /// Send IDENTIFY and read its length-prefixed reply.
+    async fn identify(&self, stream: &mut TcpStream, phase: Phase, limit: Duration) -> Result<()> {
+        self.dma(
+            stream.write_all(&dma_frame(DMA_IDENTIFY, &[])),
+            phase,
+            limit,
+        )
+        .await?;
+        let mut length = [0u8];
+        self.dma(stream.read_exact(&mut length), phase, limit)
+            .await?;
+        let mut identity = vec![0u8; usize::from(length[0])];
+        self.dma(stream.read_exact(&mut identity), phase, limit)
+            .await?;
+        Ok(())
+    }
+
+    /// Bound one socket operation and label its failure with the phase, so
+    /// the error says whether anything may have been written and mentions
+    /// the password only where it can be the cause.
     async fn dma<T>(
         &self,
         operation: impl Future<Output = std::io::Result<T>>,
-        writing: bool,
+        phase: Phase,
+        limit: Duration,
     ) -> Result<T> {
-        let failure = match tokio::time::timeout(self.timeout, operation).await {
+        let failure = match tokio::time::timeout(limit, operation).await {
             Ok(Ok(value)) => return Ok(value),
-            Err(_) => "C64U DMA transfer timed out",
+            Err(_) => "timed out",
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                "C64U DMA service closed the connection (check C64U_PASSWORD)"
+                "the service closed the connection"
             }
-            Ok(Err(_)) => "C64U DMA connection failed",
+            Ok(Err(_)) => "the connection failed",
         };
-        if writing {
-            bail!("{failure}; part of the REU range may have been written")
-        }
-        bail!("{failure}")
+        let hint = match phase {
+            Phase::Auth => " (check C64U_PASSWORD)",
+            Phase::Probe if self.password.is_none() => {
+                " (the service may be busy, or the device may require C64U_PASSWORD)"
+            }
+            Phase::Probe => " (the service may be busy)",
+            Phase::Write | Phase::Identify => "",
+        };
+        let outcome = match phase {
+            Phase::Auth | Phase::Probe => "nothing was written",
+            Phase::Write | Phase::Identify => "part of the REU range may have been written",
+        };
+        bail!("C64U DMA {} {failure}{hint}; {outcome}", phase.name())
     }
 
     fn request(
@@ -385,6 +426,26 @@ impl Device {
                 .take(2048)
                 .collect(),
         )
+    }
+}
+
+/// Steps of a DMA REU upload, for error messages.
+#[derive(Clone, Copy)]
+enum Phase {
+    Auth,
+    Probe,
+    Write,
+    Identify,
+}
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auth => "authentication",
+            Self::Probe => "probe",
+            Self::Write => "write",
+            Self::Identify => "final IDENTIFY",
+        }
     }
 }
 

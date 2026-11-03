@@ -21,7 +21,10 @@ use std::{
     collections::HashSet,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -33,7 +36,8 @@ use tokio::{
 /// handlers release the dispatch lock promptly; this only limits a handler
 /// that rmcp failed to cancel, so the process can still exit.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on resuming the CPU after a cancelled REU upload paused it.
+/// Bound on resuming the CPU after an REU upload paused it, and on other
+/// best-effort cleanup.
 const RESUME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub struct C64Server {
@@ -47,6 +51,9 @@ pub struct C64Server {
     /// Inputs this server pressed with send_input and has not released; the
     /// server releases exactly these on shutdown.
     held: Arc<std::sync::Mutex<HashSet<input::HeldInput>>>,
+    /// Set while an REU upload may have the CPU paused (its resume is armed).
+    upload_paused: Arc<AtomicBool>,
+    shutdown_join_timeout: Duration,
     accepting_calls: Arc<RwLock<bool>>,
     capture_ip: Option<Ipv4Addr>,
     capture_port: u16,
@@ -66,6 +73,8 @@ impl C64Server {
             device_lock: None,
             video_stream: Arc::default(),
             held: Arc::default(),
+            upload_paused: Arc::default(),
+            shutdown_join_timeout: SHUTDOWN_JOIN_TIMEOUT,
             accepting_calls: Arc::new(RwLock::new(true)),
             capture_ip,
             capture_port,
@@ -86,6 +95,13 @@ impl C64Server {
         self
     }
 
+    /// Bound shutdown's join of in-flight handlers; for tests.
+    #[doc(hidden)]
+    pub fn with_shutdown_join_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_join_timeout = timeout;
+        self
+    }
+
     /// Take the in-process gate, then the cross-process device lock.
     async fn operation(&self) -> Result<OperationGuard> {
         lock::acquire(
@@ -102,7 +118,7 @@ impl C64Server {
         // Join dispatch first: taking only the device lock could race a handler
         // that has not acquired it yet. The write lock also prevents late
         // handlers from entering while shutdown waits for cleanup.
-        let joined = tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, async {
+        let joined = tokio::time::timeout(self.shutdown_join_timeout, async {
             let mut accepting_calls = self.accepting_calls.write().await;
             *accepting_calls = false;
             // Input/video cancellation transfers this lock to bounded cleanup
@@ -112,8 +128,28 @@ impl C64Server {
         .await;
         if joined.is_err() {
             tracing::warn!(
-                "shutdown did not join in-flight device operations within {SHUTDOWN_JOIN_TIMEOUT:?}; exiting anyway"
+                "shutdown did not join in-flight device operations within {:?}; exiting anyway",
+                self.shutdown_join_timeout
             );
+            // An upload stuck while the CPU is paused would otherwise leave it
+            // paused: its resume guard is dropped with the runtime, too late
+            // to run. Resume it here, best effort.
+            if self.upload_paused.load(Ordering::SeqCst) {
+                match tokio::time::timeout(
+                    RESUME_CLEANUP_TIMEOUT,
+                    self.device.json(Method::PUT, "machine:resume", &[], None),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => self.upload_paused.store(false, Ordering::SeqCst),
+                    Ok(Err(error)) => tracing::warn!(
+                        "resuming the C64 paused by an unfinished REU upload failed: {error:#}"
+                    ),
+                    Err(_) => tracing::warn!(
+                        "resuming the C64 paused by an unfinished REU upload timed out; it may still be paused"
+                    ),
+                }
+            }
         }
         // Holding the gate when joined; otherwise best effort without it.
         let _device_idle = joined.ok();
@@ -335,14 +371,32 @@ struct ResumeGuard {
     device: Device,
     armed: bool,
     operation_guard: Arc<OperationGuard>,
+    /// The server's "upload paused" flag: set while armed, so shutdown can
+    /// resume the CPU if this guard never gets to.
+    paused: Arc<AtomicBool>,
 }
 impl ResumeGuard {
+    fn new(device: Device, operation_guard: Arc<OperationGuard>, paused: Arc<AtomicBool>) -> Self {
+        paused.store(true, Ordering::SeqCst);
+        Self {
+            device,
+            armed: true,
+            operation_guard,
+            paused,
+        }
+    }
+    /// Resume with the cleanup bound: this runs while holding the device
+    /// lock, so it must not wait out the full device timeout.
     async fn resume(&mut self) -> Result<()> {
-        let outcome = self
-            .device
-            .json(Method::PUT, "machine:resume", &[], None)
-            .await;
+        let outcome = tokio::time::timeout(
+            RESUME_CLEANUP_TIMEOUT,
+            self.device.json(Method::PUT, "machine:resume", &[], None),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("resuming the C64 timed out"))
+        .and_then(|outcome| outcome);
         self.armed = false;
+        self.paused.store(false, Ordering::SeqCst);
         outcome.map(|_| ())
     }
 }
@@ -353,10 +407,13 @@ impl Drop for ResumeGuard {
         {
             let device = self.device.clone();
             let operation_guard = self.operation_guard.clone();
+            let paused = self.paused.clone();
             runtime.spawn(async move {
                 let _operation_guard = operation_guard;
                 let resume = device.json(Method::PUT, "machine:resume", &[], None);
-                match tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, resume).await {
+                let outcome = tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, resume).await;
+                paused.store(false, Ordering::SeqCst);
+                match outcome {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::warn!(
                         "resuming the C64 after a cancelled REU upload failed: {error:#}"
@@ -1095,10 +1152,12 @@ impl C64Server {
                 // Arm the resume before sending the pause: a pause that times
                 // out, or a call cancelled while it is in flight, may still have
                 // paused the CPU. Resuming a running CPU is harmless.
-                let mut resume = pause.then(|| ResumeGuard {
-                    device: self.device.clone(),
-                    armed: true,
-                    operation_guard: operation_guard.clone(),
+                let mut resume = pause.then(|| {
+                    ResumeGuard::new(
+                        self.device.clone(),
+                        operation_guard.clone(),
+                        self.upload_paused.clone(),
+                    )
                 });
                 if let Some(guard) = resume.as_mut()
                     && let Err(pause) = self

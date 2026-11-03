@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 87 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 89 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -181,8 +181,15 @@ too, and the HTTP timeout applies to each socket operation.
 - `address` is a 24-bit hexadecimal REU address; `address + length` may not
   pass 16 MiB. Optional `offset` and `length` select a slice of the file
   (default: all of it). Files follow the usual 32 MiB upload limit.
-- Data goes in writes of at most 32 KiB. The tool returns only after the
-  device answers an IDENTIFY sent behind the last write, so all writes are done.
+- Before any write, an IDENTIFY probe (bounded to three seconds) checks that
+  the DMA service answers, so a busy or dead service fails with "nothing was
+  written". Data then goes in writes of at most 32 KiB. The tool returns only
+  after the device answers an IDENTIFY sent behind the last write, so all
+  writes are done.
+- DMA errors name the step that failed (connect, authentication, probe,
+  write, final IDENTIFY) and say whether part of the range may have been
+  written. Only an authentication failure (or a probe failure with no
+  password configured) points at `C64U_PASSWORD`.
 - `reset` (default `true`) resets the C64 before anything is written, so the
   program that was running cannot race the upload with its own REU DMA (a game
   stashing state every frame, a player streaming samples). After a reset only
@@ -195,7 +202,10 @@ too, and the HTTP timeout applies to each socket operation.
   resumes it afterwards, also when the write fails. If the pause fails, nothing
   is written and the server still sends a resume, because a timed-out pause may
   have taken effect. If a call is cancelled while pausing or paused, the server
-  still tries to resume, with a three-second bound. The CPU is resumed even if
+  still tries to resume, with a three-second bound
+  (every resume has that bound). If the server shuts down while it cannot
+  join an upload that paused the CPU, it sends a best-effort resume before
+  exiting. The CPU is resumed even if
   it was already paused before the call; pass `pause: false` to leave its state
   alone.
 - The range is checked only against the 24-bit limit, not against the REU size

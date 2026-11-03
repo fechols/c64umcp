@@ -50,7 +50,10 @@ enum Dma {
     RefuseAuth,
     CloseOnAuth,
     CloseAfterWrites(usize),
-    NoIdentifyReply,
+    /// Answers the IDENTIFY probe sent before the writes, not the final one.
+    NoFinalIdentifyReply,
+    /// Accepts the connection but never answers, like a busy service.
+    NoProbeReply,
     Closed,
 }
 
@@ -69,6 +72,7 @@ async fn fake_dma(log: Log, behavior: Dma) -> (u16, Option<JoinHandle<()>>) {
             };
             push(&log, Event::Connect);
             let mut writes = 0;
+            let mut identifies = 0;
             loop {
                 let mut header = [0u8; 4];
                 if stream.read_exact(&mut header).await.is_err() {
@@ -99,7 +103,13 @@ async fn fake_dma(log: Log, behavior: Dma) -> (u16, Option<JoinHandle<()>>) {
                     }
                     0xff0e if payload.is_empty() => {
                         push(&log, Event::Identify);
-                        if !matches!(behavior, Dma::NoIdentifyReply) {
+                        identifies += 1;
+                        let silent = match behavior {
+                            Dma::NoProbeReply => true,
+                            Dma::NoFinalIdentifyReply => identifies > 1,
+                            _ => false,
+                        };
+                        if !silent {
                             let _ = stream.write_all(b"\x0bULTIMATE-II").await;
                         }
                     }
@@ -208,6 +218,16 @@ impl Harness {
             )
             .await
             .unwrap()
+    }
+
+    async fn wait_until(&self, done: impl Fn(&[Event]) -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(&self.events()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("condition never met: {:?}", self.events()));
     }
 
     async fn wait_for(&self, event: Event) {
@@ -336,7 +356,8 @@ async fn guarded_upload_resets_zeroes_guard_writes_it_last_then_runs() {
     let events = h.events();
     assert_eq!(events.first(), Some(&Event::Rest("reset")));
     assert_eq!(events[1], Event::Connect);
-    assert_eq!(events[2], Event::Write(0x560000, vec![0; 16]));
+    assert_eq!(events[2], Event::Identify);
+    assert_eq!(events[3], Event::Write(0x560000, vec![0; 16]));
     assert_eq!(
         writes(&events),
         [
@@ -394,6 +415,7 @@ async fn unpaused_upload_chunks_at_32_kib_with_explicit_length_and_no_rest_calls
         events,
         [
             Event::Connect,
+            Event::Identify,
             Event::Write(0xFF0000, data[1..32769].to_vec()),
             Event::Write(0xFF8000, data[32769..].to_vec()),
             Event::Identify,
@@ -442,6 +464,7 @@ async fn reset_and_pause_together_reset_first() {
             Event::Rest("reset"),
             Event::Rest("pause"),
             Event::Connect,
+            Event::Identify,
             Event::Write(0, vec![1, 2]),
             Event::Identify,
             Event::Rest("resume"),
@@ -466,6 +489,7 @@ async fn password_authenticates_the_dma_socket_before_any_write() {
             Event::Rest("pause"),
             Event::Connect,
             Event::Auth(b"offline-secret".to_vec()),
+            Event::Identify,
             Event::Write(0, vec![1, 2, 3]),
             Event::Identify,
             Event::Rest("resume"),
@@ -524,7 +548,8 @@ async fn socket_failures_still_resume_and_skip_run_prg() {
         let events = h.events();
         assert_eq!(events.first(), Some(&Event::Rest("pause")));
         assert_eq!(events.last(), Some(&Event::Rest("resume")));
-        assert!(!events.contains(&Event::Identify));
+        // At most the probe: the final IDENTIFY is never reached.
+        assert!(events.iter().filter(|e| **e == Event::Identify).count() <= 1);
         h.finish().await;
     }
 }
@@ -612,7 +637,7 @@ async fn cancelled_pause_request_still_resumes() {
 
 #[tokio::test]
 async fn cancelled_transfer_still_resumes() {
-    let h = Harness::new(None, Dma::NoIdentifyReply).await;
+    let h = Harness::new(None, Dma::NoFinalIdentifyReply).await;
     h.machine(1, 1).await;
     let call = h
         .send(json!({
@@ -621,7 +646,9 @@ async fn cancelled_transfer_still_resumes() {
             "reset": false,
         }))
         .await;
-    h.wait_for(Event::Identify).await;
+    h.wait_for(Event::Write(0, vec![1, 2])).await;
+    h.wait_until(|events| events.iter().filter(|e| **e == Event::Identify).count() == 2)
+        .await;
     call.cancel(Some("cancel during transfer".into()))
         .await
         .unwrap();
@@ -631,12 +658,121 @@ async fn cancelled_transfer_still_resumes() {
         [
             Event::Rest("pause"),
             Event::Connect,
+            Event::Identify,
             Event::Write(0, vec![1, 2]),
             Event::Identify,
             Event::Rest("resume"),
         ]
     );
     h.finish().await;
+}
+
+#[tokio::test]
+async fn a_silent_dma_service_fails_the_probe_before_any_write() {
+    let h = Harness::new(None, Dma::NoProbeReply).await;
+    h.machine(1, 1).await;
+    h.rest("POST", "runners:run_prg", "run_prg", 200, 0).await;
+    let result = h
+        .call(json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
+            "address": "0",
+            "reset": false,
+            "run_prg": {"kind":"base64","filename":"start.prg","data":STANDARD.encode([1, 8, 0x60])},
+        }))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    let text = serde_json::to_string(&result.content).unwrap();
+    assert!(text.contains("C64U DMA probe timed out"), "{text}");
+    assert!(text.contains("nothing was written"), "{text}");
+    assert!(!text.contains("may have been written"), "{text}");
+    assert_eq!(
+        h.events(),
+        [
+            Event::Rest("pause"),
+            Event::Connect,
+            Event::Identify,
+            Event::Rest("resume"),
+        ]
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn shutdown_resumes_a_paused_upload_it_could_not_join() {
+    let http = MockServer::start().await;
+    let log = Log::default();
+    let (dma_port, dma) = fake_dma(log.clone(), Dma::NoFinalIdentifyReply).await;
+    for (route, name) in [("machine:pause", "pause"), ("machine:resume", "resume")] {
+        let log = log.clone();
+        Mock::given(method("PUT"))
+            .and(path(format!("/v1/{route}")))
+            .respond_with(move |_: &wiremock::Request| {
+                push(&log, Event::Rest(name));
+                ResponseTemplate::new(200).set_body_json(json!({"errors":[]}))
+            })
+            .mount(&http)
+            .await;
+    }
+    // A long device timeout keeps the upload stuck on its final IDENTIFY.
+    let device = Device::new(Some(&http.uri()), None, Duration::from_secs(30))
+        .unwrap()
+        .with_dma_port(dma_port);
+    let server = C64Server::new(device, None, 0, Duration::from_secs(2))
+        .with_shutdown_join_timeout(Duration::from_millis(300));
+    let shutdown = server.clone();
+    let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
+    // serve waits for the client's initialize, so run it as its own task.
+    let running = tokio::spawn(async move { server.serve(server_transport).await.unwrap() });
+    let client = ().serve(client_transport).await.unwrap();
+    let running = running.await.unwrap();
+    let _call = client
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(
+                CallToolRequestParams::new("upload_reu").with_arguments(
+                    json!({
+                        "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1])},
+                        "address": "0",
+                        "reset": false,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    let events = || log.lock().unwrap().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while events().iter().filter(|e| **e == Event::Identify).count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The handler is still running, so shutdown cannot join it.
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), shutdown.finish_shutdown())
+        .await
+        .expect("shutdown must stay bounded");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        events(),
+        [
+            Event::Rest("pause"),
+            Event::Connect,
+            Event::Identify,
+            Event::Write(0, vec![1]),
+            Event::Identify,
+            Event::Rest("resume"),
+        ]
+    );
+    drop(client);
+    drop(running);
+    if let Some(dma) = dma {
+        dma.abort();
+    }
 }
 
 #[tokio::test]
@@ -755,10 +891,12 @@ async fn servers_sharing_a_device_lock_never_interleave_uploads() {
         [
             Event::Rest("reset"),
             Event::Connect,
+            Event::Identify,
             Event::Write(0, vec![1]),
             Event::Identify,
             Event::Rest("reset"),
             Event::Connect,
+            Event::Identify,
             Event::Write(0, vec![2]),
             Event::Identify,
         ]
