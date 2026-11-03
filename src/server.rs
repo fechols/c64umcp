@@ -40,6 +40,9 @@ pub struct C64Server {
     gate: Arc<Mutex<()>>,
     /// Cross-process lock file for this device; None disables it.
     device_lock: Option<Arc<PathBuf>>,
+    /// Destination of the video stream this server started with start_stream;
+    /// a screenshot sends video back there instead of stopping it.
+    video_stream: Arc<std::sync::Mutex<Option<String>>>,
     accepting_calls: Arc<RwLock<bool>>,
     capture_ip: Option<Ipv4Addr>,
     capture_port: u16,
@@ -57,6 +60,7 @@ impl C64Server {
             device,
             gate: Arc::new(Mutex::new(())),
             device_lock: None,
+            video_stream: Arc::default(),
             accepting_calls: Arc::new(RwLock::new(true)),
             capture_ip,
             capture_port,
@@ -1255,14 +1259,19 @@ impl C64Server {
         result(
             async {
                 let _guard = self.operation().await?;
-                self.device
+                let value = self
+                    .device
                     .json(
                         Method::PUT,
                         &format!("streams/{}:start", p.stream.name()),
-                        &[("ip".into(), p.destination)],
+                        &[("ip".into(), p.destination.clone())],
                         None,
                     )
-                    .await
+                    .await?;
+                if let Stream::Video = p.stream {
+                    *self.video_stream.lock().unwrap() = Some(p.destination);
+                }
+                Ok(value)
             }
             .await,
         )
@@ -1272,8 +1281,24 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn stop_stream(&self, Parameters(p): Parameters<StreamStop>) -> CallToolResult {
-        self.locked_request(Method::PUT, &format!("streams/{}:stop", p.stream.name()))
-            .await
+        result(
+            async {
+                let _guard = self.operation().await?;
+                if let Stream::Video = p.stream {
+                    // Even a failed stop means the caller no longer wants it.
+                    *self.video_stream.lock().unwrap() = None;
+                }
+                self.device
+                    .json(
+                        Method::PUT,
+                        &format!("streams/{}:stop", p.stream.name()),
+                        &[],
+                        None,
+                    )
+                    .await
+            }
+            .await,
+        )
     }
     #[tool(
         description = "Read metadata for an absolute device file path. Firmware-dependent, not a directory listing.",
@@ -1417,7 +1442,7 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Capture a complete PAL/NTSC video frame as PNG. Takes over the video destination, can interrupt debug streaming, then stops video. Requires Ethernet and a reachable capture UDP port.",
+        description = "Capture a complete PAL/NTSC video frame as PNG. Takes over the video destination and can interrupt debug streaming. Afterwards it restarts a video stream this server started with start_stream (reported as restored_stream), and otherwise stops video. Requires Ethernet and a reachable capture UDP port.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn capture_screenshot(&self) -> CallToolResult {
@@ -1425,17 +1450,25 @@ impl C64Server {
             Ok(guard) => Arc::new(guard),
             Err(error) => return result(Err(error)),
         };
+        let restore = self.video_stream.lock().unwrap().clone();
         match video::capture(
             &self.device,
             self.capture_ip,
             self.capture_port,
             self.capture_timeout,
             Some(guard),
+            restore.clone(),
         )
         .await
         {
             Ok(png) => {
-                CallToolResult::success(vec![Content::image(STANDARD.encode(png), "image/png")])
+                let mut content = vec![Content::image(STANDARD.encode(png), "image/png")];
+                if let Some(destination) = restore {
+                    content.push(Content::text(
+                        json!({ "restored_stream": destination }).to_string(),
+                    ));
+                }
+                CallToolResult::success(content)
             }
             Err(e) => result(Err(e)),
         }

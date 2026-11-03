@@ -87,21 +87,26 @@ async fn screenshot_round_trip_returns_png_image_and_stops_stream() {
         .respond_with(move |_: &wiremock::Request| {
             tokio::spawn(async move {
                 let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                for packet_number in 0..60u16 {
-                    let mut packet = vec![0x12; 780];
-                    let line = (packet_number * 4) | if packet_number == 59 { 0x8000 } else { 0 };
-                    packet[0..2].copy_from_slice(&packet_number.to_le_bytes());
-                    packet[2..4].copy_from_slice(&42u16.to_le_bytes());
-                    packet[4..6].copy_from_slice(&line.to_le_bytes());
-                    packet[6..8].copy_from_slice(&384u16.to_le_bytes());
-                    packet[8] = 4;
-                    packet[9] = 4;
-                    packet[10..12].fill(0);
-                    sender
-                        .send_to(&packet, (std::net::Ipv4Addr::LOCALHOST, port))
-                        .await
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                // The capture drops a frame that began before the start
+                // response arrived, so send a few.
+                for frame in 42..45u16 {
+                    for packet_number in 0..60u16 {
+                        let mut packet = vec![0x12; 780];
+                        let line =
+                            (packet_number * 4) | if packet_number == 59 { 0x8000 } else { 0 };
+                        packet[0..2].copy_from_slice(&packet_number.to_le_bytes());
+                        packet[2..4].copy_from_slice(&frame.to_le_bytes());
+                        packet[4..6].copy_from_slice(&line.to_le_bytes());
+                        packet[6..8].copy_from_slice(&384u16.to_le_bytes());
+                        packet[8] = 4;
+                        packet[9] = 4;
+                        packet[10..12].fill(0);
+                        sender
+                            .send_to(&packet, (std::net::Ipv4Addr::LOCALHOST, port))
+                            .await
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                 }
             });
             ResponseTemplate::new(200).set_body_json(json!({"errors":[]}))

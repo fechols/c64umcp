@@ -2,11 +2,11 @@
 //!
 //! The packet format and palette follow the Ultimate documentation and its
 //! `python/grab.py` example. This controls the device's single video stream;
-//! starting video also stops a running debug stream. Previous streams and their
-//! destinations are not restored.
+//! starting video also stops a running debug stream. A video stream that this
+//! server started is restarted afterwards; other streams are not restored.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::Duration,
@@ -88,6 +88,8 @@ impl PendingFrame {
 struct VideoAssembler {
     pending: VecDeque<PendingFrame>,
     last_completed: Option<u16>,
+    /// Frames that began before the stream was (re)started for this capture.
+    stale: HashSet<u16>,
     packets: usize,
     invalid_packets: usize,
 }
@@ -115,7 +117,7 @@ impl VideoAssembler {
             self.invalid_packets = self.invalid_packets.saturating_add(1);
             return None;
         }
-        if self.last_completed == Some(number) {
+        if self.last_completed == Some(number) || self.stale.contains(&number) {
             return None;
         }
         let index = match self.pending.iter().position(|frame| frame.number == number) {
@@ -172,15 +174,17 @@ impl VideoAssembler {
 
 /// A capture owns its caller's device-operation lock until stream cleanup ends,
 /// including when the MCP request is cancelled and this guard is dropped.
+/// Cleanup restarts the stream at `restore` if set, and stops it otherwise.
 struct StreamCleanup {
     device: Device,
     operation_guard: Option<Arc<OperationGuard>>,
+    restore: Option<String>,
     armed: bool,
 }
 
 impl StreamCleanup {
     async fn finish(&mut self) -> Result<()> {
-        let result = stop_stream(&self.device).await;
+        let result = end_stream(&self.device, self.restore.as_deref()).await;
         self.armed = false;
         result
     }
@@ -193,11 +197,12 @@ impl Drop for StreamCleanup {
         }
         let device = self.device.clone();
         let operation_guard = self.operation_guard.take();
+        let restore = self.restore.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 // Keep the lock in this task even if the original request has gone away.
                 let _operation_guard = operation_guard;
-                if let Err(error) = stop_stream(&device).await {
+                if let Err(error) = end_stream(&device, restore.as_deref()).await {
                     tracing::warn!("video cleanup after cancellation failed: {error:#}");
                 }
             });
@@ -207,15 +212,47 @@ impl Drop for StreamCleanup {
     }
 }
 
-async fn stop_stream(device: &Device) -> Result<()> {
-    tokio::time::timeout(
-        CLEANUP_TIMEOUT,
-        device.json(Method::PUT, "streams/video:stop", &[], None),
-    )
-    .await
-    .context("timed out stopping the video stream; it may still be running")?
-    .context("failed to stop the video stream; it may still be running")?;
+/// Stop video, or send it back to `restore`, the destination of a stream this
+/// server started before the capture took it over.
+async fn end_stream(device: &Device, restore: Option<&str>) -> Result<()> {
+    match restore {
+        None => {
+            tokio::time::timeout(
+                CLEANUP_TIMEOUT,
+                device.json(Method::PUT, "streams/video:stop", &[], None),
+            )
+            .await
+            .context("timed out stopping the video stream; it may still be running")?
+            .context("failed to stop the video stream; it may still be running")?;
+        }
+        Some(destination) => {
+            let query = [("ip".to_owned(), destination.to_owned())];
+            let restart = device.json(Method::PUT, "streams/video:start", &query, None);
+            tokio::time::timeout(CLEANUP_TIMEOUT, restart)
+                .await
+                .with_context(|| {
+                    format!("timed out restoring the video stream to {destination}; video may still go to the capture port")
+                })?
+                .with_context(|| {
+                    format!("failed to restore the video stream to {destination}; video may still go to the capture port")
+                })?;
+        }
+    }
     Ok(())
+}
+
+/// Discard datagrams already queued on the capture socket and return the
+/// frame numbers they carried. Those frames began before the stream was
+/// started for this capture, so the rest of each is ignored too.
+fn queued_frames(socket: &UdpSocket) -> HashSet<u16> {
+    let mut stale = HashSet::new();
+    let mut buffer = vec![0u8; 65536];
+    while let Ok((length, _)) = socket.try_recv_from(&mut buffer) {
+        if length == PACKET_BYTES {
+            stale.insert(u16::from_le_bytes([buffer[2], buffer[3]]));
+        }
+    }
+    stale
 }
 
 /// Locks onto the first sender of a valid video packet and rejects others.
@@ -245,8 +282,15 @@ impl SenderLock {
     }
 }
 
-async fn receive_frame(socket: &UdpSocket, duration: Duration) -> Result<Frame> {
-    let mut assembler = VideoAssembler::default();
+async fn receive_frame(
+    socket: &UdpSocket,
+    duration: Duration,
+    stale: HashSet<u16>,
+) -> Result<Frame> {
+    let mut assembler = VideoAssembler {
+        stale,
+        ..VideoAssembler::default()
+    };
     let mut lock = SenderLock::default();
     // Receive any UDP datagram in a fixed-size buffer. A smaller buffer causes
     // WSAEMSGSIZE on Windows before sender filtering or packet validation runs.
@@ -289,14 +333,18 @@ async fn receive_frame(socket: &UdpSocket, duration: Duration) -> Result<Frame> 
 ///
 /// `capture_ip` is a local interface reachable from the C64U; absent means infer
 /// the local IPv4 route. Port zero chooses a free port. The operation takes over
-/// the video destination and stops video afterward; it does not restore another
-/// application's stream. Cleanup is best effort after cancellation/process exit.
+/// the video destination; afterwards it restarts video at `restore` (the
+/// destination of a stream this server started) or else stops video. It does
+/// not restore another application's stream. Frames that began before the
+/// start response are dropped. Cleanup is best effort after
+/// cancellation/process exit.
 pub async fn capture(
     device: &Device,
     capture_ip: Option<Ipv4Addr>,
     port: u16,
     timeout: Duration,
     operation_guard: Option<Arc<OperationGuard>>,
+    restore: Option<String>,
 ) -> Result<Vec<u8>> {
     ensure!(
         !timeout.is_zero() && timeout <= Duration::from_secs(60),
@@ -351,6 +399,7 @@ pub async fn capture(
     let mut cleanup = StreamCleanup {
         device: device.clone(),
         operation_guard,
+        restore,
         armed: true,
     };
     // Arm before sending start: the device can start even if its response is lost.
@@ -366,9 +415,13 @@ pub async fn capture(
         )
         .await
         .context("timed out starting video stream")??;
+        // A fixed capture port may already hold packets from an earlier
+        // stream that was never stopped; never return such a frame.
+        let stale = queued_frames(&socket);
         let frame = receive_frame(
             &socket,
             deadline.saturating_duration_since(tokio::time::Instant::now()),
+            stale,
         )
         .await?;
         tracing::debug!(
@@ -559,7 +612,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
-        let frame = receive_frame(&receiver, Duration::from_secs(3))
+        let frame = receive_frame(&receiver, Duration::from_secs(3), HashSet::new())
             .await
             .unwrap();
         assert_eq!(frame.number, 9);
@@ -587,7 +640,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
-        let frame = receive_frame(&receiver, Duration::from_secs(3))
+        let frame = receive_frame(&receiver, Duration::from_secs(3), HashSet::new())
             .await
             .unwrap();
         assert_eq!(frame.number, 18);
@@ -599,14 +652,18 @@ mod tests {
     async fn timeouts_distinguish_missing_packets_from_incomplete_frame() {
         let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let timeout = Duration::from_millis(25);
-        let error = receive_frame(&receiver, timeout).await.unwrap_err();
+        let error = receive_frame(&receiver, timeout, HashSet::new())
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("no video packets"));
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         sender
             .send_to(&packet(0, 1, 240, 0), receiver.local_addr().unwrap())
             .await
             .unwrap();
-        let error = receive_frame(&receiver, timeout).await.unwrap_err();
+        let error = receive_frame(&receiver, timeout, HashSet::new())
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("no complete video frame"));
     }
 
@@ -645,18 +702,25 @@ mod tests {
                 0,
                 Duration::from_secs(3),
                 None,
+                None,
             )
             .await
         });
         let destination = started_destination(&server).await;
         assert_ne!(destination.port(), 0);
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        for row in (0..240).step_by(4) {
-            sender
-                .send_to(&packet(row, 1, 240, 0xa2), destination)
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        // A frame that began before the start response is dropped, so keep
+        // sending frames until one is captured.
+        let mut number = 1;
+        while !task.is_finished() {
+            for row in (0..240).step_by(4) {
+                sender
+                    .send_to(&packet(row, number, 240, 0xa2), destination)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            number += 1;
         }
         let image = task.await.unwrap().unwrap();
         assert!(image.starts_with(b"\x89PNG\r\n\x1a\n"));
@@ -679,6 +743,7 @@ mod tests {
             Some(Ipv4Addr::LOCALHOST),
             0,
             Duration::from_millis(200),
+            None,
             None,
         )
         .await
@@ -709,6 +774,7 @@ mod tests {
                 0,
                 Duration::from_secs(3),
                 Some(operation_guard),
+                None,
             )
             .await
         });
@@ -743,6 +809,7 @@ mod tests {
             0,
             Duration::from_millis(100),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -776,6 +843,7 @@ mod tests {
             let mut cleanup = StreamCleanup {
                 device,
                 operation_guard: Some(operation_guard),
+                restore: None,
                 armed: true,
             };
             cleanup.finish().await
@@ -795,6 +863,97 @@ mod tests {
         let _guard = tokio::time::timeout(Duration::from_secs(5), lock.lock())
             .await
             .expect("stop cleanup must be bounded independently of HTTP timeout");
+        server.verify().await;
+    }
+
+    #[test]
+    fn stale_frames_never_complete() {
+        let mut decoder = VideoAssembler {
+            stale: HashSet::from([5]),
+            ..VideoAssembler::default()
+        };
+        for row in (0..240).step_by(4) {
+            assert!(decoder.feed(&packet(row, 5, 240, 0xa2)).is_none());
+        }
+        assert_eq!(complete_frame(&mut decoder, 6, 240).number, 6);
+    }
+
+    #[tokio::test]
+    async fn packets_queued_before_the_start_response_mark_their_frames_stale() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        for row in (0..120).step_by(4) {
+            sender
+                .send_to(&packet(row, 30, 240, 0x11), destination)
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stale = queued_frames(&receiver);
+        assert_eq!(stale, HashSet::from([30]));
+        let send = tokio::spawn(async move {
+            // The rest of the stale frame, then a fresh one.
+            for (start, number) in [(120, 30), (0, 31)] {
+                for row in (start..240).step_by(4) {
+                    sender
+                        .send_to(&packet(row, number, 240, 0xa2), destination)
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        let frame = receive_frame(&receiver, Duration::from_secs(3), stale)
+            .await
+            .unwrap();
+        assert_eq!(frame.number, 31);
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_restores_a_stream_this_server_started_instead_of_stopping() {
+        let (server, device) = mock_device().await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/streams/video:start"))
+            .and(wiremock::matchers::query_param("ip", "192.0.2.7:11000"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"errors": []})),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/streams/video:stop"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"errors": []})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = capture(
+            &device,
+            Some(Ipv4Addr::LOCALHOST),
+            0,
+            Duration::from_millis(200),
+            None,
+            Some("192.0.2.7:11000".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no video packets"));
+        let requests = server.received_requests().await.unwrap();
+        let last = requests.last().unwrap();
+        assert!(last.url.path().ends_with("video:start"));
+        assert_eq!(
+            last.url
+                .query_pairs()
+                .find(|(name, _)| name == "ip")
+                .unwrap()
+                .1,
+            "192.0.2.7:11000"
+        );
         server.verify().await;
     }
 }

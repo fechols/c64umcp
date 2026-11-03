@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 80 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 84 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -246,9 +246,13 @@ prevents it from executing.
 ### Screenshots
 
 `capture_screenshot` binds a UDP receiver, starts video to that receiver,
-assembles a complete frame, encodes PNG, then stops video. It captures the
+assembles a complete frame, encodes PNG, then stops video, or restores the
+stream this server started (see below). It captures the
 documented cropped image: PAL 384×272 or NTSC 384×240, with a fixed reference palette.
-It rejects incomplete frames and ignores packets from other IPs.
+It rejects incomplete frames and ignores packets from other IPs. A frame
+whose packets were already waiting on the capture port when the start
+response arrived (for example from an earlier stream that was never stopped)
+is dropped; the next one is used.
 
 Video requires supported hardware and **Ethernet** on the Ultimate side.
 Allow inbound UDP on the capture port in your firewall. On multi-interface
@@ -257,7 +261,11 @@ Capture timeout covers setup/start/receive; stream cleanup has an additional
 three-second bound. Errors distinguish no packets from incomplete frames.
 
 Capture takes over the single video destination and can interrupt debug streaming.
-It stops video afterward and does not restore another application's streams.
+If this server started video with `start_stream` (and has not stopped it with
+`stop_stream`), the capture sends video back to that destination afterwards,
+also after a failure or cancellation, and the result adds a text block
+`{"restored_stream":"<destination>"}`. Otherwise it stops video. It does not
+restore streams started by another process or application.
 Cancellation attempts cleanup; communication failure or abrupt process termination
 can leave a stream running. Use `stop_stream` if needed.
 

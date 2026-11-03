@@ -28,9 +28,13 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_capture(None, Duration::from_secs(2)).await
+    }
+
+    async fn with_capture(capture_ip: Option<std::net::Ipv4Addr>, capture: Duration) -> Self {
         let http = MockServer::start().await;
         let device = Device::new(Some(&http.uri()), None, Duration::from_secs(2)).unwrap();
-        let server = C64Server::new(device, None, 0, Duration::from_secs(2));
+        let server = C64Server::new(device, capture_ip, 0, capture);
         let (server_transport, client_transport) = tokio::io::duplex(65536);
         let server = tokio::spawn(async move {
             server
@@ -530,5 +534,63 @@ async fn input_batches_are_validated_before_any_device_events_are_sent() {
         );
     }
     assert_eq!(h.http.received_requests().await.unwrap().len(), 1);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn screenshot_restores_the_video_stream_this_server_started() {
+    let h = Harness::with_capture(
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        Duration::from_millis(300),
+    )
+    .await;
+    for route in ["streams/video:start", "streams/video:stop"] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/v1/{route}")))
+            .respond_with(okay())
+            .mount(&h.http)
+            .await;
+    }
+    let video_calls = |requests: Vec<wiremock::Request>| -> Vec<String> {
+        requests
+            .iter()
+            .map(|request| {
+                let ip = request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == "ip")
+                    .map(|(_, ip)| ip.into_owned());
+                let route = request.url.path().rsplit('/').next().unwrap().to_owned();
+                match ip {
+                    Some(ip) if ip.starts_with("127.0.0.1:") => format!("{route} capture"),
+                    Some(ip) => format!("{route} {ip}"),
+                    None => route,
+                }
+            })
+            .collect()
+    };
+    h.success(
+        "start_stream",
+        json!({"stream":"video","destination":"192.0.2.7:11000"}),
+    )
+    .await;
+    // No packets arrive, so the capture fails; its cleanup still runs.
+    h.failure("capture_screenshot", json!({}), "no video packets")
+        .await;
+    assert_eq!(
+        video_calls(h.http.received_requests().await.unwrap()),
+        [
+            "video:start 192.0.2.7:11000",
+            "video:start capture",
+            "video:start 192.0.2.7:11000",
+        ]
+    );
+    h.success("stop_stream", json!({"stream":"video"})).await;
+    h.failure("capture_screenshot", json!({}), "no video packets")
+        .await;
+    assert_eq!(
+        video_calls(h.http.received_requests().await.unwrap())[3..],
+        ["video:stop", "video:start capture", "video:stop"]
+    );
     h.finish().await;
 }
