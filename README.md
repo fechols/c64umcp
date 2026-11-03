@@ -4,7 +4,7 @@ A Rust MCP server for controlling a Commodore 64 Ultimate over its LAN REST API.
 Runs locally over **stdio**, with 45 typed tools for programs, drives, configuration,
 memory, REU uploads, input, and screenshots. One device per process.
 
-**Status:** 91 offline tests pass. A scratch-session campaign on C64 Ultimate
+**Status:** 93 offline tests pass. A scratch-session campaign on C64 Ultimate
 firmware 1.1.0 passed 32 tools through the real stdio MCP server, including program
 uploads, cartridge launch, RAM writes, drive/configuration changes, machine controls,
 and screenshots. A separate 60-cycle soak completed without failures. Five tools
@@ -95,6 +95,17 @@ Annotations describe effects; they are not a separate permission system.
 On a normal MCP stdin close, the server waits (up to 10 seconds) for active
 handlers and bounded keyboard/video cleanup, then releases inputs it still
 holds, before exiting.
+
+Shutdown signals take the same path: Ctrl-C and Ctrl-Break (and on Windows a
+console close, logoff or system shutdown; on Unix SIGTERM and SIGHUP) cancel
+in-flight calls as a closed transport would, run the same cleanup (resuming
+a paused upload, releasing held inputs, stopping or restoring video), and
+exit with a nonzero status (130; 143 for SIGTERM, 129 for SIGHUP). Windows
+kills a process about five seconds after a close, logoff or shutdown event,
+so those get a total bound of 3.5 seconds. A second signal during that
+cleanup exits at once, without finishing it. A hard kill (TerminateProcess,
+Task Manager's End task, SIGKILL) cannot clean up: the C64 may stay paused,
+inputs held, or video streaming.
 
 ### Program and disk sources
 

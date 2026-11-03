@@ -115,10 +115,31 @@ impl C64Server {
     /// its requests. Call this before shutting down the Tokio runtime, including
     /// when waiting for the service returned an error.
     pub async fn finish_shutdown(&self) {
+        self.finish_shutdown_within(None).await
+    }
+
+    /// Like `finish_shutdown`, but all of it within `budget` when given, for
+    /// a shutdown the OS will cut short (Windows kills a process about five
+    /// seconds after a console close, logoff or shutdown event). The join
+    /// leaves at least a second of the budget for the cleanup after it.
+    pub async fn finish_shutdown_within(&self, budget: Option<Duration>) {
+        let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
+        let join_timeout = match budget {
+            None => self.shutdown_join_timeout,
+            Some(budget) => self
+                .shutdown_join_timeout
+                .min(budget.saturating_sub(Duration::from_secs(1))),
+        };
+        // Each cleanup step keeps its own bound, cut to what is left.
+        let cleanup_limit = || match deadline {
+            None => RESUME_CLEANUP_TIMEOUT,
+            Some(deadline) => RESUME_CLEANUP_TIMEOUT
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        };
         // Join dispatch first: taking only the device lock could race a handler
         // that has not acquired it yet. The write lock also prevents late
         // handlers from entering while shutdown waits for cleanup.
-        let joined = tokio::time::timeout(self.shutdown_join_timeout, async {
+        let joined = tokio::time::timeout(join_timeout, async {
             let mut accepting_calls = self.accepting_calls.write().await;
             *accepting_calls = false;
             // Input/video cancellation transfers this lock to bounded cleanup
@@ -128,15 +149,14 @@ impl C64Server {
         .await;
         if joined.is_err() {
             tracing::warn!(
-                "shutdown did not join in-flight device operations within {:?}; exiting anyway",
-                self.shutdown_join_timeout
+                "shutdown did not join in-flight device operations within {join_timeout:?}; exiting anyway"
             );
             // An upload stuck while the CPU is paused would otherwise leave it
             // paused: its resume guard is dropped with the runtime, too late
             // to run. Resume it here, best effort.
             if self.upload_paused.load(Ordering::SeqCst) {
                 match tokio::time::timeout(
-                    RESUME_CLEANUP_TIMEOUT,
+                    cleanup_limit(),
                     self.device.json(Method::PUT, "machine:resume", &[], None),
                 )
                 .await
@@ -153,12 +173,12 @@ impl C64Server {
         }
         // Holding the gate when joined; otherwise best effort without it.
         let _device_idle = joined.ok();
-        self.release_held_inputs().await;
+        self.release_held_inputs(cleanup_limit()).await;
     }
 
     /// Release the inputs this server still holds, and only those: another
     /// client's inputs stay pressed. Bounded by the cleanup timeout.
-    async fn release_held_inputs(&self) {
+    async fn release_held_inputs(&self, limit: Duration) {
         let held = std::mem::take(&mut *self.held.lock().unwrap());
         if held.is_empty() {
             return;
@@ -171,7 +191,7 @@ impl C64Server {
             }
             Ok::<_, anyhow::Error>(())
         };
-        match tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, release).await {
+        match tokio::time::timeout(limit, release).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!("releasing held inputs at shutdown failed: {error:#}")
