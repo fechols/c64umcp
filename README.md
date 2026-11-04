@@ -56,6 +56,7 @@ Restart the server after changing its environment.
 | `--capture-port` | `C64U_CAPTURE_PORT` | 11000 (0 picks a free port per capture) |
 | `--capture-timeout` | `C64U_CAPTURE_TIMEOUT` | 5 seconds; range 1–60 |
 | `--lock-dir` | `C64U_LOCK_DIR` | The system temp directory (`%TEMP%`, `$TMPDIR` or `/tmp`) |
+| `--lock-timeout` | `C64U_LOCK_TIMEOUT` | 120 seconds; range 1–600 |
 
 CLI options override environment values. Host accepts a hostname, IP, optional
 port, or HTTP(S) root URL, with optional `/v1`. It does not accept credentials,
@@ -84,11 +85,14 @@ Several agents often drive one C64U, each through its own server process. The
 multi-step and destructive tools (`upload_reu`, `type_text`,
 `capture_screenshot`, `start_stream`, `stop_stream`, `run_prg`, `run_crt`,
 `load_prg`, `play_sid`, `play_mod`, `reset_machine`, `reboot_machine`,
-`poweroff_machine`, `pause_machine`, `resume_machine`) therefore also take an
+`poweroff_machine`, `pause_machine`, `resume_machine`) and the input tools
+(`send_input`, `release_all_inputs`) therefore also take an
 OS file lock, `c64umcp-<host>.lock` in the lock directory, for their whole
 run, including cleanup. A second server on **the same computer** waits for
-it, so one agent's pause, reset, upload or capture cannot interleave with
-another's. The lock does not reach servers on other computers, servers using
+it, so one agent's pause, reset, upload, typing or capture cannot interleave
+with another's. The wait is bounded by the lock timeout, after which the call
+fails; while waiting, the server's other tools keep working. The lock file
+only needs read access, so servers run by different users can share it. The lock does not reach servers on other computers, servers using
 another lock directory, or the same device configured under another
 hostname or address; other tools are serialized per process only.
 Annotations describe effects; they are not a separate permission system.
@@ -258,9 +262,11 @@ and tapped. Joystick ports are 1/2; inputs are up/down/left/right/fire/fire2/fir
 range 1–1000), and at most 1000 characters. It validates all text first, then
 presses/releases one chord at a time. Letters use unshifted physical C64 keys:
 on the usual uppercase/graphics screen they appear uppercase; menu/lowercase
-modes differ. CRLF becomes one Return. Keys held through `send_input` before
-the call (a Shift, say) are pressed with each chord but not released, so they
-stay held afterwards.
+modes differ. CRLF becomes one Return. Modifiers held through `send_input`
+before the call (Shift, Ctrl, Commodore) are pressed with each chord but not
+released, so they stay held afterwards. Any other held key that the text types
+is released first, since a key that is already down types nothing; the result
+lists those as `released_held_keys`.
 
 Supported punctuation: `+ - . : @ , * ; = / ! " # $ % & ' ( ) ? < > [ ]`,
 plus digits, spaces and newlines. Other characters are rejected.
@@ -292,17 +298,21 @@ Capture takes over the single video destination and can interrupt debug streamin
 If this server started video with `start_stream` (and has not stopped it with
 `stop_stream`), the capture sends video back to that destination afterwards,
 also after a failure or cancellation, and the result adds a text block
-`{"restored_stream":"<destination>"}`. Otherwise it stops video. It does not
-restore streams started by another process or application.
+`{"restored_stream":"<destination>"}`. Otherwise it stops video. Starting a
+debug stream takes over the video channel, so this server then forgets its
+video stream. It does not see or restore streams started or changed by another
+process or application.
 Cancellation attempts cleanup; communication failure or abrupt process termination
 can leave a stream running. Use `stop_stream` if needed.
 
 `read_text_screen` is a separate 40×25 memory interpretation, default address
 `0400`; `include_colors:true` also reads color RAM. That read goes through the
-CPU's memory map at $D800, so the tool also reads the processor port
-($00/$01) and adds `colors_reliable`: `false` means I/O was banked out (LORAM
-and HIRAM low, or CHAREN low) and the colors are RAM or character ROM bytes.
-Cartridge mappings are not considered. Screen codes $60 and $E0 (shifted
+CPU's memory map at $D800, so the tool adds `colors_reliable`. The processor
+port ($00/$01) cannot be read over DMA (that returns the RAM beneath it), so
+the tool reads the VIC raster register ($D012) before and after the color
+read: it only moves while I/O is visible. `false` means I/O appeared banked out
+and the colors are likely RAM or ROM bytes; about one read in 312 also reports
+`false` when the raster happens to match. Screen codes $60 and $E0 (shifted
 space) decode as a space. It assumes the default
 uppercase/graphics character set and preserves raw codes. It does not reproduce
 sprites, bitmap graphics, custom glyphs or raster effects.

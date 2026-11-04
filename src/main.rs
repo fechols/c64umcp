@@ -26,6 +26,10 @@ struct Options {
     /// other server processes on this computer; default: the system temp directory.
     #[arg(long, env = "C64U_LOCK_DIR")]
     lock_dir: Option<PathBuf>,
+    /// Maximum time to wait for another server process to finish with the
+    /// device, in seconds.
+    #[arg(long, env = "C64U_LOCK_TIMEOUT", default_value_t = 120)]
+    lock_timeout: u64,
 }
 
 /// How long the service gets to stop after a signal cancels it, before the
@@ -46,6 +50,10 @@ async fn main() -> Result<()> {
         (1..=60).contains(&options.capture_timeout),
         "capture timeout must be 1..60 seconds"
     );
+    ensure!(
+        (1..=600).contains(&options.lock_timeout),
+        "lock timeout must be 1..600 seconds"
+    );
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -65,7 +73,8 @@ async fn main() -> Result<()> {
         options.capture_port,
         Duration::from_secs(options.capture_timeout),
     )
-    .with_lock_dir(options.lock_dir.unwrap_or_else(std::env::temp_dir));
+    .with_lock_dir(options.lock_dir.unwrap_or_else(std::env::temp_dir))
+    .with_lock_timeout(Duration::from_secs(options.lock_timeout));
     let mut signals = signals::Signals::new();
     let service = server.clone().serve(stdio()).await?;
     let token = service.cancellation_token();

@@ -469,11 +469,7 @@ async fn menu_and_text_snapshots_decode_their_distinct_binary_formats() {
         .await;
     let mut screen = vec![32; 1000];
     screen[..2].copy_from_slice(&[1, 0x82]);
-    for (address, bytes) in [
-        ("0400", screen),
-        ("D800", vec![0xf6; 1000]),
-        ("0000", vec![0x2f, 0x37]),
-    ] {
+    for (address, bytes) in [("0400", screen), ("D800", vec![0xf6; 1000])] {
         let length = bytes.len().to_string();
         Mock::given(method("GET"))
             .and(path("/v1/machine:readmem"))
@@ -484,10 +480,28 @@ async fn menu_and_text_snapshots_decode_their_distinct_binary_formats() {
                     .set_body_bytes(bytes)
                     .insert_header("Content-Type", "application/octet-stream"),
             )
-            .expect(1)
+            .expect(2)
             .mount(&h.http)
             .await;
     }
+    // The raster register: moving around the first color read (I/O visible),
+    // then constant around the second (I/O banked out, $D012 is RAM or ROM).
+    let raster = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+        0x10u8, 0x80, 0x33, 0x33,
+    ])));
+    Mock::given(method("GET"))
+        .and(path("/v1/machine:readmem"))
+        .and(query_param("address", "D012"))
+        .and(query_param("length", "1"))
+        .respond_with(move |_: &wiremock::Request| {
+            let byte = raster.lock().unwrap().pop_front().unwrap();
+            ResponseTemplate::new(200)
+                .set_body_bytes(vec![byte])
+                .insert_header("Content-Type", "application/octet-stream")
+        })
+        .expect(4)
+        .mount(&h.http)
+        .await;
     let menu = h.success("read_menu_screen", json!({})).await;
     assert!(menu["rows"][0].as_str().unwrap().starts_with("HI"));
     assert_eq!(menu["reverse"][1], true);
@@ -501,6 +515,10 @@ async fn menu_and_text_snapshots_decode_their_distinct_binary_formats() {
     assert_eq!(screen["reverse"][1], true);
     assert_eq!(screen["colors"][0], 6);
     assert_eq!(screen["colors_reliable"], true);
+    let screen = h
+        .success("read_text_screen", json!({"include_colors":true}))
+        .await;
+    assert_eq!(screen["colors_reliable"], false);
     h.finish().await;
 }
 
@@ -540,6 +558,61 @@ async fn input_batches_are_validated_before_any_device_events_are_sent() {
         );
     }
     assert_eq!(h.http.received_requests().await.unwrap().len(), 1);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn typing_a_held_key_releases_it_first_and_forgets_it() {
+    let h = Harness::new().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/machine:input"))
+        .respond_with(okay())
+        .expect(8)
+        .mount(&h.http)
+        .await;
+    h.success(
+        "send_input",
+        json!({"events":[{"kind":"keyboard","inputs":["b"],"transition":"press"}]}),
+    )
+    .await;
+    let typed = h
+        .success("type_text", json!({"text":"bb","hold_ms":1,"gap_ms":1}))
+        .await;
+    assert_eq!(typed["characters_typed"], 2);
+    assert_eq!(typed["released_held_keys"], json!(["b"]));
+    // `b` is no longer recorded as held, so it is not released again.
+    let typed = h
+        .success("type_text", json!({"text":"b","hold_ms":1,"gap_ms":1}))
+        .await;
+    assert!(typed.get("released_held_keys").is_none());
+    let transitions: Vec<String> = h
+        .http
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let event = &request.body_json::<Value>().unwrap()["events"][0];
+            format!(
+                "{} {}",
+                event["inputs"][0].as_str().unwrap(),
+                event["transition"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        transitions,
+        [
+            "b press",
+            "b release",
+            "b press",
+            "b release",
+            "b press",
+            "b release",
+            "b press",
+            "b release",
+        ]
+    );
     h.finish().await;
 }
 
@@ -597,6 +670,52 @@ async fn screenshot_restores_the_video_stream_this_server_started() {
     assert_eq!(
         video_calls(h.http.received_requests().await.unwrap())[3..],
         ["video:stop", "video:start capture", "video:stop"]
+    );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_debug_stream_replaces_the_video_stream_a_screenshot_restores() {
+    let h = Harness::with_capture(
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        Duration::from_millis(300),
+    )
+    .await;
+    for route in [
+        "streams/video:start",
+        "streams/video:stop",
+        "streams/debug:start",
+    ] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/v1/{route}")))
+            .respond_with(okay())
+            .mount(&h.http)
+            .await;
+    }
+    h.success(
+        "start_stream",
+        json!({"stream":"video","destination":"192.0.2.7:11000"}),
+    )
+    .await;
+    h.success(
+        "start_stream",
+        json!({"stream":"debug","destination":"192.0.2.8:11002"}),
+    )
+    .await;
+    h.failure("capture_screenshot", json!({}), "no video packets")
+        .await;
+    let routes: Vec<String> = h
+        .http
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.path().rsplit('/').next().unwrap().to_owned())
+        .collect();
+    // Video is stopped afterwards, not sent back to 192.0.2.7.
+    assert_eq!(
+        routes,
+        ["video:start", "debug:start", "video:start", "video:stop"]
     );
     h.finish().await;
 }

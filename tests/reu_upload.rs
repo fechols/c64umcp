@@ -499,6 +499,47 @@ async fn password_authenticates_the_dma_socket_before_any_write() {
 }
 
 #[tokio::test]
+async fn a_failed_resume_is_reported_and_retried() {
+    let h = Harness::new(None, Dma::Normal).await;
+    h.rest("PUT", "machine:pause", "pause", 200, 1).await;
+    let log = h.log.clone();
+    let resumes = Arc::new(AtomicU64::new(0));
+    Mock::given(method("PUT"))
+        .and(path("/v1/machine:resume"))
+        .respond_with(move |_: &wiremock::Request| {
+            push(&log, Event::Rest("resume"));
+            // Only the first attempt fails.
+            if resumes.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500).set_body_json(json!({"errors":["test failure"]}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"errors":[]}))
+            }
+        })
+        .expect(2)
+        .mount(&h.http)
+        .await;
+    h.failure(
+        json!({
+            "source": {"kind":"base64","filename":"x.bin","data":STANDARD.encode([1, 2, 3])},
+            "address": "0",
+            "reset": false,
+        }),
+        "resuming the C64 failed",
+    )
+    .await;
+    // The armed guard retries once after the failed resume.
+    h.wait_until(|events| {
+        events
+            .iter()
+            .filter(|event| **event == Event::Rest("resume"))
+            .count()
+            == 2
+    })
+    .await;
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn refused_authentication_writes_nothing_and_still_resumes() {
     let h = Harness::new(Some("wrong"), Dma::RefuseAuth).await;
     h.machine(1, 1).await;

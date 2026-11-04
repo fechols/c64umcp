@@ -179,7 +179,7 @@ pub fn apply(held: &mut HashSet<HeldInput>, events: &[InputEvent]) {
 }
 
 /// Request bodies releasing exactly `held`, and nothing another client holds.
-pub fn release_bodies(held: &HashSet<HeldInput>) -> Vec<Value> {
+pub fn release_bodies(held: &HashSet<HeldInput>) -> Result<Vec<Value>> {
     let mut sorted: Vec<_> = held.iter().collect();
     sorted.sort();
     let mut events = Vec::new();
@@ -204,10 +204,7 @@ pub fn release_bodies(held: &HashSet<HeldInput>) -> Vec<Value> {
             });
         }
     }
-    events
-        .chunks(16)
-        .filter_map(|batch| validate_events(batch).ok())
-        .collect()
+    events.chunks(16).map(validate_events).collect()
 }
 
 /// Map the supported ASCII subset to physical C64 chords. Letter case folds to
@@ -345,9 +342,16 @@ impl Drop for KeyReleaseGuard {
     }
 }
 
+/// Keys that change other keys' meaning; holding one while typing is useful.
+pub fn is_modifier(key: &str) -> bool {
+    matches!(key, "left_shift" | "right_shift" | "ctrl" | "commodore")
+}
+
 /// Caller must serialize the entire operation against other machine operations.
-/// Keys in `held` (pressed earlier by the caller, such as a modifier) are
-/// pressed with each chord as usual but never released.
+/// `held` is the keys the caller pressed earlier. Held modifiers are pressed
+/// with each chord as usual but never released. A held non-modifier that the
+/// text types is released first, since a key that is already down produces
+/// no keystroke; the result lists those keys as `released_held_keys`.
 pub async fn type_text(
     device: &Device,
     text: &str,
@@ -365,6 +369,22 @@ pub async fn type_text(
         (1..=1000).contains(&gap_ms),
         "gap_ms must be between 1 and 1000"
     );
+    let mut released: Vec<String> = held
+        .iter()
+        .filter(|key| !is_modifier(key) && chords.iter().any(|chord| chord.contains(*key)))
+        .cloned()
+        .collect();
+    released.sort();
+    for keys in released.chunks(8) {
+        send_chord(device, keys, Transition::Release)
+            .await
+            .context("releasing held keys the text types")?;
+    }
+    let held: HashSet<String> = held
+        .iter()
+        .filter(|key| is_modifier(key))
+        .cloned()
+        .collect();
     let mut guard = KeyReleaseGuard {
         device: device.clone(),
         active: None,
@@ -403,10 +423,12 @@ pub async fn type_text(
         completed += 1;
         tokio::time::sleep(Duration::from_millis(gap_ms)).await;
     }
-    Ok(
-        json!({ "characters_typed": completed, "hold_ms": hold_ms, "gap_ms": gap_ms,
-        "letter_case": "ASCII letters use unshifted C64 keys; appearance depends on the active character set" }),
-    )
+    let mut value = json!({ "characters_typed": completed, "hold_ms": hold_ms, "gap_ms": gap_ms,
+        "letter_case": "ASCII letters use unshifted C64 keys; appearance depends on the active character set" });
+    if !released.is_empty() {
+        value["released_held_keys"] = json!(released);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -551,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typing_keeps_keys_the_caller_already_holds() {
+    async fn typing_keeps_held_modifiers_and_retypes_held_keys() {
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
@@ -560,12 +582,15 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/machine:input"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"errors":[]})))
-            .expect(3)
+            .expect(7)
             .mount(&server)
             .await;
         let device = Device::new(Some(&server.uri()), None, Duration::from_secs(2)).unwrap();
-        let held = HashSet::from(["left_shift".to_string(), "b".to_string()]);
-        type_text(&device, "!b", 1, 1, &held, None).await.unwrap();
+        // `c` is held but not typed, so it stays down.
+        let held = HashSet::from(["left_shift".to_string(), "b".to_string(), "c".to_string()]);
+        let value = type_text(&device, "!bb", 1, 1, &held, None).await.unwrap();
+        assert_eq!(value["characters_typed"], 3);
+        assert_eq!(value["released_held_keys"], json!(["b"]));
         let events: Vec<Value> = server
             .received_requests()
             .await
@@ -573,12 +598,19 @@ mod tests {
             .iter()
             .map(|r| r.body_json::<Value>().unwrap()["events"][0].clone())
             .collect();
+        let key = |keys: &[&str], transition: &str| json!({"kind":"keyboard","inputs":keys,"transition":transition});
         assert_eq!(
             events,
             [
-                json!({"kind":"keyboard","inputs":["left_shift","1"],"transition":"press"}),
-                json!({"kind":"keyboard","inputs":["1"],"transition":"release"}),
-                json!({"kind":"keyboard","inputs":["b"],"transition":"press"}),
+                // A held `b` gives no new keystroke, so it is released first.
+                key(&["b"], "release"),
+                // The held shift stays down after `!`.
+                key(&["left_shift", "1"], "press"),
+                key(&["1"], "release"),
+                key(&["b"], "press"),
+                key(&["b"], "release"),
+                key(&["b"], "press"),
+                key(&["b"], "release"),
             ]
         );
         server.verify().await;
@@ -601,7 +633,7 @@ mod tests {
             HashSet::from([(2, "fire".to_string()), (0, "left_shift".to_string())])
         );
         assert_eq!(
-            release_bodies(&held),
+            release_bodies(&held).unwrap(),
             [json!({"events":[
                 {"kind":"keyboard","inputs":["left_shift"],"transition":"release"},
                 {"kind":"joystick","port":2,"inputs":["fire"],"transition":"release"},
@@ -609,7 +641,28 @@ mod tests {
         );
         apply(&mut held, &[InputEvent::ReleaseAll {}]);
         assert!(held.is_empty());
-        assert!(release_bodies(&held).is_empty());
+        assert!(release_bodies(&held).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_possible_held_set_releases_in_valid_batches() {
+        let mut held: HashSet<HeldInput> = KEY_NAMES
+            .iter()
+            .filter(|key| **key != "restore")
+            .map(|key| key.to_string())
+            .chain(('a'..='z').chain('0'..='9').map(String::from))
+            .map(|key| (0, key))
+            .collect();
+        for port in [1, 2] {
+            held.extend(JOYSTICK_NAMES.iter().map(|name| (port, name.to_string())));
+        }
+        let bodies = release_bodies(&held).unwrap();
+        let released: usize = bodies
+            .iter()
+            .flat_map(|body| body["events"].as_array().unwrap())
+            .map(|event| event["inputs"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(released, held.len());
     }
 
     #[tokio::test]

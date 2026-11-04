@@ -39,12 +39,23 @@ const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on resuming the CPU after an REU upload paused it, and on other
 /// best-effort cleanup.
 const RESUME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How a device call is serialized.
+#[derive(Clone, Copy)]
+enum Lock {
+    /// Within this server process only: single requests.
+    Gate,
+    /// Also with other server processes on this computer: multi-step,
+    /// destructive or input operations.
+    Device,
+}
 #[derive(Clone)]
 pub struct C64Server {
     device: Device,
     gate: Arc<Mutex<()>>,
     /// Cross-process lock file for this device; None disables it.
     device_lock: Option<Arc<PathBuf>>,
+    /// Bound on waiting for another process to release the device lock.
+    lock_timeout: Duration,
     /// Destination of the video stream this server started with start_stream;
     /// a screenshot sends video back there instead of stopping it.
     video_stream: Arc<std::sync::Mutex<Option<String>>>,
@@ -71,6 +82,7 @@ impl C64Server {
             device,
             gate: Arc::new(Mutex::new(())),
             device_lock: None,
+            lock_timeout: lock::DEFAULT_LOCK_TIMEOUT,
             video_stream: Arc::default(),
             held: Arc::default(),
             upload_paused: Arc::default(),
@@ -95,6 +107,13 @@ impl C64Server {
         self
     }
 
+    /// How long an operation waits for another process to release the device
+    /// lock before failing.
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
     /// Bound shutdown's join of in-flight handlers; for tests.
     #[doc(hidden)]
     pub fn with_shutdown_join_timeout(mut self, timeout: Duration) -> Self {
@@ -102,11 +121,22 @@ impl C64Server {
         self
     }
 
-    /// Take the in-process gate, then the cross-process device lock.
-    async fn operation(&self) -> Result<OperationGuard> {
+    /// Serialize a device call: `Lock::Gate` within this server only,
+    /// `Lock::Device` also with other server processes.
+    async fn guard(&self, lock: Lock) -> Result<OperationGuard> {
+        match lock {
+            Lock::Gate => Ok(OperationGuard::gate_only(
+                self.gate.clone().lock_owned().await,
+            )),
+            Lock::Device => self.device_guard(self.lock_timeout).await,
+        }
+    }
+
+    async fn device_guard(&self, timeout: Duration) -> Result<OperationGuard> {
         lock::acquire(
             &self.gate,
             self.device_lock.as_deref().map(PathBuf::as_path),
+            timeout,
         )
         .await
     }
@@ -151,28 +181,48 @@ impl C64Server {
             tracing::warn!(
                 "shutdown did not join in-flight device operations within {join_timeout:?}; exiting anyway"
             );
-            // An upload stuck while the CPU is paused would otherwise leave it
-            // paused: its resume guard is dropped with the runtime, too late
-            // to run. Resume it here, best effort.
-            if self.upload_paused.load(Ordering::SeqCst) {
-                match tokio::time::timeout(
-                    cleanup_limit(),
-                    self.device.json(Method::PUT, "machine:resume", &[], None),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => self.upload_paused.store(false, Ordering::SeqCst),
-                    Ok(Err(error)) => tracing::warn!(
-                        "resuming the C64 paused by an unfinished REU upload failed: {error:#}"
-                    ),
-                    Err(_) => tracing::warn!(
-                        "resuming the C64 paused by an unfinished REU upload timed out; it may still be paused"
-                    ),
-                }
+        }
+        // An upload stuck while the CPU is paused would otherwise leave it
+        // paused: its resume guard is dropped with the runtime, too late to
+        // run. The flag also stays set when an upload's resume and its retry
+        // both failed. Resume here, best effort.
+        if self.upload_paused.load(Ordering::SeqCst) {
+            match tokio::time::timeout(
+                cleanup_limit(),
+                self.device.json(Method::PUT, "machine:resume", &[], None),
+            )
+            .await
+            {
+                Ok(Ok(_)) => self.upload_paused.store(false, Ordering::SeqCst),
+                Ok(Err(error)) => tracing::warn!(
+                    "resuming the C64 paused by an unfinished REU upload failed: {error:#}"
+                ),
+                Err(_) => tracing::warn!(
+                    "resuming the C64 paused by an unfinished REU upload timed out; it may still be paused"
+                ),
             }
         }
-        // Holding the gate when joined; otherwise best effort without it.
-        let _device_idle = joined.ok();
+        // Nothing new can start now. Release the gate so the release below
+        // can take it together with the device lock.
+        drop(joined);
+        if self.held.lock().unwrap().is_empty() {
+            return;
+        }
+        // Keep the release out of another process's typing or upload. If the
+        // lock cannot be had in time, release anyway: leaving keys pressed is
+        // worse.
+        let limit = cleanup_limit();
+        let _device = match tokio::time::timeout(limit, self.device_guard(limit)).await {
+            Ok(Ok(guard)) => Some(guard),
+            Ok(Err(error)) => {
+                tracing::warn!("releasing held inputs without the device lock: {error:#}");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("releasing held inputs without the device lock: it stayed busy");
+                None
+            }
+        };
         self.release_held_inputs(cleanup_limit()).await;
     }
 
@@ -184,7 +234,7 @@ impl C64Server {
             return;
         }
         let release = async {
-            for body in input::release_bodies(&held) {
+            for body in input::release_bodies(&held)? {
                 self.device
                     .json(Method::POST, "machine:input", &[], Some(body))
                     .await?;
@@ -202,28 +252,26 @@ impl C64Server {
         }
     }
 
+    /// One JSON device call under `lock`.
     async fn request(
         &self,
+        lock: Lock,
         method: Method,
         route: &str,
         query: Vec<(String, String)>,
         body: Option<Value>,
     ) -> CallToolResult {
-        let _guard = self.gate.lock().await;
-        result(self.device.json(method, route, &query, body).await)
-    }
-    /// Like `request`, but also holds the cross-process device lock.
-    async fn locked_request(&self, method: Method, route: &str) -> CallToolResult {
         result(
             async {
-                let _guard = self.operation().await?;
-                self.device.json(method, route, &[], None).await
+                let _guard = self.guard(lock).await?;
+                self.device.json(method, route, &query, body).await
             }
             .await,
         )
     }
     async fn drive_action(&self, drive: Drive, verb: &str) -> CallToolResult {
         self.request(
+            Lock::Gate,
             Method::PUT,
             &format!("drives/{}:{verb}", drive.name()),
             vec![],
@@ -261,7 +309,7 @@ impl C64Server {
                     },
                 };
                 let route = format!("runners:{command}");
-                let _guard = self.operation().await?;
+                let _guard = self.guard(Lock::Device).await?;
                 match source {
                     ResolvedSource::Remote(path) => {
                         query.push(("file".into(), path));
@@ -405,19 +453,16 @@ impl ResumeGuard {
             paused,
         }
     }
-    /// Resume with the cleanup bound: this runs while holding the device
-    /// lock, so it must not wait out the full device timeout.
+    /// Resume as an ordinary request with the device timeout. Only success
+    /// disarms the guard: after a failure it stays armed, so dropping it
+    /// retries once (bounded), and shutdown still sees the CPU as paused.
     async fn resume(&mut self) -> Result<()> {
-        let outcome = tokio::time::timeout(
-            RESUME_CLEANUP_TIMEOUT,
-            self.device.json(Method::PUT, "machine:resume", &[], None),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("resuming the C64 timed out"))
-        .and_then(|outcome| outcome);
+        self.device
+            .json(Method::PUT, "machine:resume", &[], None)
+            .await?;
         self.armed = false;
         self.paused.store(false, Ordering::SeqCst);
-        outcome.map(|_| ())
+        Ok(())
     }
 }
 impl Drop for ResumeGuard {
@@ -431,15 +476,14 @@ impl Drop for ResumeGuard {
             runtime.spawn(async move {
                 let _operation_guard = operation_guard;
                 let resume = device.json(Method::PUT, "machine:resume", &[], None);
-                let outcome = tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, resume).await;
-                paused.store(false, Ordering::SeqCst);
-                match outcome {
-                    Ok(Ok(_)) => {}
+                // On failure the flag stays set, so shutdown tries once more.
+                match tokio::time::timeout(RESUME_CLEANUP_TIMEOUT, resume).await {
+                    Ok(Ok(_)) => paused.store(false, Ordering::SeqCst),
                     Ok(Err(error)) => tracing::warn!(
-                        "resuming the C64 after a cancelled REU upload failed: {error:#}"
+                        "resuming the C64 after an unfinished REU upload failed: {error:#}"
                     ),
                     Err(_) => tracing::warn!(
-                        "resuming the C64 after a cancelled REU upload timed out; it may still be paused"
+                        "resuming the C64 after an unfinished REU upload timed out; it may still be paused"
                     ),
                 }
             });
@@ -837,87 +881,113 @@ impl C64Server {
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn get_version(&self) -> CallToolResult {
-        self.request(Method::GET, "version", vec![], None).await
+        self.request(Lock::Gate, Method::GET, "version", vec![], None)
+            .await
     }
     #[tool(
         description = "Read device product, firmware and identity.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn get_info(&self) -> CallToolResult {
-        self.request(Method::GET, "info", vec![], None).await
+        self.request(Lock::Gate, Method::GET, "info", vec![], None)
+            .await
     }
     #[tool(
         description = "List configuration categories.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn list_config_categories(&self) -> CallToolResult {
-        self.request(Method::GET, "configs", vec![], None).await
+        self.request(Lock::Gate, Method::GET, "configs", vec![], None)
+            .await
     }
     #[tool(
         description = "Replace current settings with saved flash settings.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn load_config_from_flash(&self) -> CallToolResult {
-        self.request(Method::PUT, "configs:load_from_flash", vec![], None)
-            .await
+        self.request(
+            Lock::Gate,
+            Method::PUT,
+            "configs:load_from_flash",
+            vec![],
+            None,
+        )
+        .await
     }
     #[tool(
         description = "Persist all current configuration to nonvolatile flash.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn save_config_to_flash(&self) -> CallToolResult {
-        self.request(Method::PUT, "configs:save_to_flash", vec![], None)
-            .await
+        self.request(
+            Lock::Gate,
+            Method::PUT,
+            "configs:save_to_flash",
+            vec![],
+            None,
+        )
+        .await
     }
     #[tool(
         description = "Reset current configuration to defaults; does not save to flash.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn reset_config_defaults(&self) -> CallToolResult {
-        self.request(Method::PUT, "configs:reset_to_default", vec![], None)
-            .await
+        self.request(
+            Lock::Gate,
+            Method::PUT,
+            "configs:reset_to_default",
+            vec![],
+            None,
+        )
+        .await
     }
     #[tool(
         description = "Reset the C64; current program state is lost.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn reset_machine(&self) -> CallToolResult {
-        self.locked_request(Method::PUT, "machine:reset").await
+        self.request(Lock::Device, Method::PUT, "machine:reset", vec![], None)
+            .await
     }
     #[tool(
         description = "Restart the machine and reinitialize cartridge configuration.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn reboot_machine(&self) -> CallToolResult {
-        self.locked_request(Method::PUT, "machine:reboot").await
+        self.request(Lock::Device, Method::PUT, "machine:reboot", vec![], None)
+            .await
     }
     #[tool(
         description = "Pause the CPU until resume_machine; timers may continue.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn pause_machine(&self) -> CallToolResult {
-        self.locked_request(Method::PUT, "machine:pause").await
+        self.request(Lock::Device, Method::PUT, "machine:pause", vec![], None)
+            .await
     }
     #[tool(
         description = "Resume the paused CPU.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn resume_machine(&self) -> CallToolResult {
-        self.locked_request(Method::PUT, "machine:resume").await
+        self.request(Lock::Device, Method::PUT, "machine:resume", vec![], None)
+            .await
     }
     #[tool(
         description = "Power off supported hardware. A disconnect leaves the outcome uncertain.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn poweroff_machine(&self) -> CallToolResult {
-        self.locked_request(Method::PUT, "machine:poweroff").await
+        self.request(Lock::Device, Method::PUT, "machine:poweroff", vec![], None)
+            .await
     }
     #[tool(
         description = "Toggle the firmware menu. While open, injected keys reach the menu.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn toggle_menu(&self) -> CallToolResult {
-        self.request(Method::PUT, "machine:menu_button", vec![], None)
+        self.request(Lock::Gate, Method::PUT, "machine:menu_button", vec![], None)
             .await
     }
     #[tool(
@@ -925,7 +995,7 @@ impl C64Server {
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn read_debug_register(&self) -> CallToolResult {
-        self.request(Method::GET, "machine:debugreg", vec![], None)
+        self.request(Lock::Gate, Method::GET, "machine:debugreg", vec![], None)
             .await
     }
     #[tool(
@@ -933,14 +1003,15 @@ impl C64Server {
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn list_drives(&self) -> CallToolResult {
-        self.request(Method::GET, "drives", vec![], None).await
+        self.request(Lock::Gate, Method::GET, "drives", vec![], None)
+            .await
     }
     #[tool(
         description = "Read REST-injected keyboard and joystick state; firmware-dependent.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn get_input_state(&self) -> CallToolResult {
-        self.request(Method::GET, "machine:input", vec![], None)
+        self.request(Lock::Gate, Method::GET, "machine:input", vec![], None)
             .await
     }
     #[tool(
@@ -1031,7 +1102,8 @@ impl C64Server {
                 )));
             }
         };
-        self.request(Method::GET, &route, vec![], None).await
+        self.request(Lock::Gate, Method::GET, &route, vec![], None)
+            .await
     }
     #[tool(
         description = "Set one configuration value (string or integer); wildcard paths can affect multiple items. Does not save flash.",
@@ -1046,6 +1118,7 @@ impl C64Server {
             return result(Err(anyhow::anyhow!("category and item must be nonempty")));
         }
         self.request(
+            Lock::Gate,
             Method::PUT,
             &format!("configs/{}/{}", segment(&p.category), segment(&p.item)),
             vec![("value".into(), value)],
@@ -1061,8 +1134,14 @@ impl C64Server {
         if let Err(e) = validate_config_batch(&p.settings) {
             return result(Err(e));
         }
-        self.request(Method::POST, "configs", vec![], Some(p.settings))
-            .await
+        self.request(
+            Lock::Gate,
+            Method::POST,
+            "configs",
+            vec![],
+            Some(p.settings),
+        )
+        .await
     }
     #[tool(
         description = "Read bank-dependent C64 memory, returning hex and base64. Address is hexadecimal; length defaults to 256.",
@@ -1160,7 +1239,7 @@ impl C64Server {
                 let reset = p.reset;
                 let pause = p.pause.unwrap_or(!reset);
 
-                let operation_guard = Arc::new(self.operation().await?);
+                let operation_guard = Arc::new(self.guard(Lock::Device).await?);
                 // Reset first, so the old program cannot DMA into the REU while
                 // it is written. Nothing is armed yet, so failure needs no cleanup.
                 if reset {
@@ -1267,6 +1346,7 @@ impl C64Server {
             }
         };
         self.request(
+            Lock::Gate,
             Method::PUT,
             "machine:debugreg",
             vec![("value".into(), format!("{value:02X}"))],
@@ -1347,6 +1427,7 @@ impl C64Server {
             DriveMode::D1581 => "1581",
         };
         self.request(
+            Lock::Gate,
             Method::PUT,
             &format!("drives/{}:set_mode", p.drive.name()),
             vec![("mode".into(), mode.into())],
@@ -1371,7 +1452,7 @@ impl C64Server {
         }
         result(
             async {
-                let _guard = self.operation().await?;
+                let _guard = self.guard(Lock::Device).await?;
                 let value = self
                     .device
                     .json(
@@ -1381,8 +1462,11 @@ impl C64Server {
                         None,
                     )
                     .await?;
-                if let Stream::Video = p.stream {
-                    *self.video_stream.lock().unwrap() = Some(p.destination);
+                match p.stream {
+                    Stream::Video => *self.video_stream.lock().unwrap() = Some(p.destination),
+                    // Debug streaming takes over the video channel.
+                    Stream::Debug => *self.video_stream.lock().unwrap() = None,
+                    Stream::Audio => {}
                 }
                 Ok(value)
             }
@@ -1396,7 +1480,7 @@ impl C64Server {
     async fn stop_stream(&self, Parameters(p): Parameters<StreamStop>) -> CallToolResult {
         result(
             async {
-                let _guard = self.operation().await?;
+                let _guard = self.guard(Lock::Device).await?;
                 if let Stream::Video = p.stream {
                     // Even a failed stop means the caller no longer wants it.
                     *self.video_stream.lock().unwrap() = None;
@@ -1422,8 +1506,14 @@ impl C64Server {
             Ok(v) => v,
             Err(e) => return result(Err(e)),
         };
-        self.request(Method::GET, &format!("files/{path}:info"), vec![], None)
-            .await
+        self.request(
+            Lock::Gate,
+            Method::GET,
+            &format!("files/{path}:info"),
+            vec![],
+            None,
+        )
+        .await
     }
     #[tool(
         description = "Create a disk image at an absolute device path. May overwrite an existing file. D64 defaults to 35 tracks (35 or 40 supported); DNP requires 1..255.",
@@ -1461,7 +1551,7 @@ impl C64Server {
             Ok((format!("files/{path}:create_{format}"), query))
         })();
         match validated {
-            Ok((route, q)) => self.request(Method::PUT, &route, q, None).await,
+            Ok((route, q)) => self.request(Lock::Gate, Method::PUT, &route, q, None).await,
             Err(e) => result(Err(e)),
         }
     }
@@ -1474,7 +1564,12 @@ impl C64Server {
             Ok(body) => body,
             Err(e) => return result(Err(e)),
         };
-        let _guard = self.gate.lock().await;
+        // The device lock keeps these inputs out of another process's paced
+        // typing or upload.
+        let _guard = match self.guard(Lock::Device).await {
+            Ok(guard) => guard,
+            Err(e) => return result(Err(e)),
+        };
         // Record presses before sending: a lost or cancelled response may
         // still have pressed them, and shutdown must release them.
         self.held.lock().unwrap().extend(input::pressed(&p.events));
@@ -1492,7 +1587,10 @@ impl C64Server {
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn release_all_inputs(&self) -> CallToolResult {
-        let _guard = self.gate.lock().await;
+        let _guard = match self.guard(Lock::Device).await {
+            Ok(guard) => guard,
+            Err(e) => return result(Err(e)),
+        };
         let sent = self
             .device
             .json(
@@ -1508,15 +1606,16 @@ impl C64Server {
         result(sent)
     }
     #[tool(
-        description = "Type supported ASCII using paced physical C64 keys, default 50 ms held/50 ms gap. Letter case folds to unshifted keys; use raw events for exact modifiers. Firmware-dependent; no RAM fallback.",
+        description = "Type supported ASCII using paced physical C64 keys, default 50 ms held/50 ms gap. Letter case folds to unshifted keys; use raw events for exact modifiers. Modifiers held with send_input stay held; other held keys the text types are released first (reported as released_held_keys). Firmware-dependent; no RAM fallback.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn type_text(&self, Parameters(p): Parameters<TypeText>) -> CallToolResult {
-        let guard = match self.operation().await {
+        let guard = match self.guard(Lock::Device).await {
             Ok(guard) => Arc::new(guard),
             Err(error) => return result(Err(error)),
         };
-        // Keys the caller holds (a modifier, say) must stay held after typing.
+        // Held modifiers stay held after typing; other held keys the text
+        // types are released first (see input::type_text).
         let held: HashSet<String> = self
             .held
             .lock()
@@ -1534,7 +1633,18 @@ impl C64Server {
                 &held,
                 Some(guard),
             )
-            .await,
+            .await
+            .inspect(|value| {
+                // Held keys the text typed were released first. After a
+                // failure they stay listed: releasing them again at shutdown
+                // is harmless.
+                if let Some(keys) = value["released_held_keys"].as_array() {
+                    let mut held = self.held.lock().unwrap();
+                    for key in keys.iter().filter_map(Value::as_str) {
+                        held.remove(&(0, key.to_string()));
+                    }
+                }
+            }),
         )
     }
     #[tool(
@@ -1549,7 +1659,7 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Read a 40x25 text-memory snapshot (default $0400), optionally color RAM. Color RAM is read through the CPU memory map at $D800, so with include_colors the result adds colors_reliable, false when the processor port ($00/$01) has I/O banked out and $D800 holds RAM or character ROM instead. Not a screenshot: custom glyphs, bitmap graphics, sprites and raster effects are not represented.",
+        description = "Read a 40x25 text-memory snapshot (default $0400), optionally color RAM. Color RAM is read through the CPU memory map at $D800, so with include_colors the result adds colors_reliable, inferred from the VIC raster register ($D012) changing around the read: false when I/O appears banked out and $D800 holds RAM or ROM instead, or when that could not be confirmed. Not a screenshot: custom glyphs, bitmap graphics, sprites and raster effects are not represented.",
         annotations(read_only_hint = true)
     )]
     async fn read_text_screen(&self, Parameters(p): Parameters<TextScreen>) -> CallToolResult {
@@ -1568,23 +1678,25 @@ impl C64Server {
                     )
                     .await?;
                 let (colors, colors_reliable) = if p.include_colors {
-                    // $D800 is color RAM only while I/O is banked in; read
-                    // the processor port to tell.
-                    let port = self
-                        .device
-                        .binary(
-                            "machine:readmem",
-                            &[
-                                ("address".into(), "0000".into()),
-                                ("length".into(), "2".into()),
-                            ],
-                        )
-                        .await?;
-                    ensure!(
-                        port.len() == 2,
-                        "processor port read returned {} bytes",
-                        port.len()
-                    );
+                    // $D800 is color RAM only while I/O is banked in. The
+                    // processor port cannot be read over DMA (that returns
+                    // the RAM beneath it), so read the VIC raster register
+                    // before and after: it only moves while I/O is visible.
+                    let raster = || async {
+                        let byte = self
+                            .device
+                            .binary(
+                                "machine:readmem",
+                                &[
+                                    ("address".into(), "D012".into()),
+                                    ("length".into(), "1".into()),
+                                ],
+                            )
+                            .await?;
+                        ensure!(byte.len() == 1, "raster read returned {} bytes", byte.len());
+                        Ok(byte[0])
+                    };
+                    let before = raster().await?;
                     let colors = self
                         .device
                         .binary(
@@ -1595,7 +1707,8 @@ impl C64Server {
                             ],
                         )
                         .await?;
-                    (Some(colors), Some(screen::io_visible(port[0], port[1])))
+                    let after = raster().await?;
+                    (Some(colors), Some(before != after))
                 } else {
                     (None, None)
                 };
@@ -1610,11 +1723,11 @@ impl C64Server {
         )
     }
     #[tool(
-        description = "Capture a complete PAL/NTSC video frame as PNG. Takes over the video destination and can interrupt debug streaming. Afterwards it restarts a video stream this server started with start_stream (reported as restored_stream), and otherwise stops video. Requires Ethernet and a reachable capture UDP port.",
+        description = "Capture a complete PAL/NTSC video frame as PNG. Takes over the video destination and can interrupt debug streaming. Afterwards it restarts a video stream this server started with start_stream (reported as restored_stream), and otherwise stops video; starting a debug stream forgets that video stream. Stream changes made by other processes or on the device are not seen. Requires Ethernet and a reachable capture UDP port.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
     async fn capture_screenshot(&self) -> CallToolResult {
-        let guard = match self.operation().await {
+        let guard = match self.guard(Lock::Device).await {
             Ok(guard) => Arc::new(guard),
             Err(error) => return result(Err(error)),
         };
