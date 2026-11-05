@@ -135,11 +135,15 @@ impl Harness {
         Self::with_lock_dir(password, behavior, None).await
     }
 
-    async fn with_lock_dir(password: Option<&str>, behavior: Dma, lock_dir: Option<&Path>) -> Self {
+    async fn with_lock_dir(
+        password: Option<&str>,
+        behavior: Dma,
+        lock: Option<&Locking<'_>>,
+    ) -> Self {
         let http = MockServer::start().await;
         let log = Log::default();
         let (dma_port, dma) = fake_dma(log.clone(), behavior).await;
-        let (client, server) = connect(&http.uri(), password, dma_port, lock_dir).await;
+        let (client, server) = connect(&http.uri(), password, dma_port, lock).await;
         Self {
             http,
             log,
@@ -257,19 +261,29 @@ impl Harness {
     }
 }
 
+/// Cross-process device lock settings for a test server.
+struct Locking<'a> {
+    dir: &'a Path,
+    wait: Duration,
+    lease: Duration,
+}
+
 /// Serve one MCP server for the device at `uri`, as a separate C64Server.
 async fn connect(
     uri: &str,
     password: Option<&str>,
     dma_port: u16,
-    lock_dir: Option<&Path>,
+    lock: Option<&Locking<'_>>,
 ) -> (RunningService<RoleClient, ()>, JoinHandle<()>) {
     let device = Device::new(Some(uri), password, Duration::from_secs(2))
         .unwrap()
         .with_dma_port(dma_port);
     let mut server = C64Server::new(device, None, 0, Duration::from_secs(2));
-    if let Some(dir) = lock_dir {
-        server = server.with_lock_dir(dir);
+    if let Some(lock) = lock {
+        server = server
+            .with_lock_dir(lock.dir)
+            .with_lock_timeout(lock.wait)
+            .with_lock_lease(lock.lease);
     }
     let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
     let server = tokio::spawn(async move {
@@ -886,7 +900,13 @@ async fn invalid_ranges_and_sources_never_reach_the_device() {
 async fn servers_sharing_a_device_lock_never_interleave_uploads() {
     let lock_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("reu-locks-{}", std::process::id()));
-    let h = Harness::with_lock_dir(None, Dma::Normal, Some(&lock_dir)).await;
+    // No lease and a long wait: the second upload waits for the first.
+    let lock = Locking {
+        dir: &lock_dir,
+        wait: Duration::from_secs(10),
+        lease: Duration::ZERO,
+    };
+    let h = Harness::with_lock_dir(None, Dma::Normal, Some(&lock)).await;
     let log = h.log.clone();
     // A slow reset keeps the first upload inside the lock while the second starts.
     Mock::given(method("PUT"))
@@ -900,7 +920,7 @@ async fn servers_sharing_a_device_lock_never_interleave_uploads() {
         .expect(2)
         .mount(&h.http)
         .await;
-    let (mut other, other_server) = connect(&h.http.uri(), None, h.dma_port, Some(&lock_dir)).await;
+    let (mut other, other_server) = connect(&h.http.uri(), None, h.dma_port, Some(&lock)).await;
     let first = h
         .send(json!({
             "source": {"kind":"base64","filename":"a.bin","data":STANDARD.encode([1])},
@@ -942,6 +962,82 @@ async fn servers_sharing_a_device_lock_never_interleave_uploads() {
             Event::Identify,
         ]
     );
+    other.close().await.unwrap();
+    other_server.await.unwrap();
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn a_server_using_the_device_denies_other_servers_until_it_releases_it() {
+    let lock_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("deny-locks-{}", std::process::id()));
+    // A long lease: the first server keeps the device after its call.
+    let first = Locking {
+        dir: &lock_dir,
+        wait: Duration::ZERO,
+        lease: Duration::from_secs(60),
+    };
+    let h = Harness::with_lock_dir(None, Dma::Normal, Some(&first)).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/info"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"errors":[]})))
+        .expect(2)
+        .mount(&h.http)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/machine:pause"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"errors":[]})))
+        .expect(1)
+        .mount(&h.http)
+        .await;
+    async fn info(client: &RunningService<RoleClient, ()>, tool: &'static str) -> CallToolResult {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool(CallToolRequestParams::new(tool)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+    let text = |result: &CallToolResult| serde_json::to_string(&result.content).unwrap();
+    // A mutating call starts the lease.
+    let owned = info(&h.client, "pause_machine").await;
+    assert_ne!(owned.is_error, Some(true), "{}", text(&owned));
+
+    let second = Locking {
+        dir: &lock_dir,
+        wait: Duration::from_millis(200),
+        lease: Duration::ZERO,
+    };
+    let (mut other, other_server) = connect(&h.http.uri(), None, h.dma_port, Some(&second)).await;
+    let denied = info(&other, "get_info").await;
+    assert_eq!(denied.is_error, Some(true));
+    let message = text(&denied);
+    for part in [
+        "device busy:",
+        "finished pause_machine",
+        "idle lease",
+        "nothing was sent",
+    ] {
+        assert!(message.contains(part), "{part} missing: {message}");
+    }
+    let status = info(&other, "device_lock_status").await;
+    let status = status.structured_content.expect("structured status");
+    assert_eq!(status["held_by_another_server"], true, "{status}");
+
+    let released = info(&h.client, "release_device").await;
+    assert_eq!(
+        released.structured_content.as_ref().unwrap()["released"],
+        true,
+        "{}",
+        text(&released)
+    );
+    // A read-only call holds the device only while it runs: the other
+    // server gets it right after.
+    let read = info(&h.client, "get_info").await;
+    assert_ne!(read.is_error, Some(true), "{}", text(&read));
+    let allowed = info(&other, "get_info").await;
+    assert_ne!(allowed.is_error, Some(true), "{}", text(&allowed));
     other.close().await.unwrap();
     other_server.await.unwrap();
     h.finish().await;

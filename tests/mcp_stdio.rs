@@ -180,7 +180,7 @@ async fn executable_negotiates_discovers_and_calls_device_with_structured_conten
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(tools.len(), 45, "expected complete tool catalog");
+    assert_eq!(tools.len(), 48, "expected complete tool catalog");
     for name in [
         "get_version",
         "get_info",
@@ -189,6 +189,9 @@ async fn executable_negotiates_discovers_and_calls_device_with_structured_conten
         "upload_reu",
         "send_input",
         "capture_screenshot",
+        "claim_device",
+        "release_device",
+        "device_lock_status",
     ] {
         let tool = tools
             .iter()

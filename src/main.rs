@@ -22,14 +22,19 @@ struct Options {
     /// Maximum time to wait for a complete video frame, in seconds.
     #[arg(long, env = "C64U_CAPTURE_TIMEOUT", default_value_t = 5)]
     capture_timeout: u64,
-    /// Directory for the per-device lock file that serializes operations with
+    /// Directory for the per-device lock file that shares the device with
     /// other server processes on this computer; default: the system temp directory.
     #[arg(long, env = "C64U_LOCK_DIR")]
     lock_dir: Option<PathBuf>,
-    /// Maximum time to wait for another server process to finish with the
-    /// device, in seconds.
-    #[arg(long, env = "C64U_LOCK_TIMEOUT", default_value_t = 120)]
+    /// Time to wait for another server process to release the device before
+    /// a call is denied, in seconds; 0 denies at once.
+    #[arg(long, env = "C64U_LOCK_TIMEOUT", default_value_t = 2)]
     lock_timeout: u64,
+    /// Time this server keeps the device after its last call, so other
+    /// server processes cannot interleave with a sequence of calls, in
+    /// seconds; 0 releases it after each call.
+    #[arg(long, env = "C64U_LOCK_LEASE", default_value_t = 10)]
+    lock_lease: u64,
 }
 
 /// How long the service gets to stop after a signal cancels it, before the
@@ -51,8 +56,12 @@ async fn main() -> Result<()> {
         "capture timeout must be 1..60 seconds"
     );
     ensure!(
-        (1..=600).contains(&options.lock_timeout),
-        "lock timeout must be 1..600 seconds"
+        options.lock_timeout <= 600,
+        "lock timeout must be 0..600 seconds"
+    );
+    ensure!(
+        options.lock_lease <= 300,
+        "lock lease must be 0..300 seconds"
     );
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -74,7 +83,8 @@ async fn main() -> Result<()> {
         Duration::from_secs(options.capture_timeout),
     )
     .with_lock_dir(options.lock_dir.unwrap_or_else(std::env::temp_dir))
-    .with_lock_timeout(Duration::from_secs(options.lock_timeout));
+    .with_lock_timeout(Duration::from_secs(options.lock_timeout))
+    .with_lock_lease(Duration::from_secs(options.lock_lease));
     let mut signals = signals::Signals::new();
     let service = server.clone().serve(stdio()).await?;
     let token = service.cancellation_token();

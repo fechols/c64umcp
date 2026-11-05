@@ -56,7 +56,8 @@ Restart the server after changing its environment.
 | `--capture-port` | `C64U_CAPTURE_PORT` | 11000 (0 picks a free port per capture) |
 | `--capture-timeout` | `C64U_CAPTURE_TIMEOUT` | 5 seconds; range 1–60 |
 | `--lock-dir` | `C64U_LOCK_DIR` | The system temp directory (`%TEMP%`, `$TMPDIR` or `/tmp`) |
-| `--lock-timeout` | `C64U_LOCK_TIMEOUT` | 120 seconds; range 1–600 |
+| `--lock-timeout` | `C64U_LOCK_TIMEOUT` | 2 seconds to wait before a call is denied; range 0–600 (0 denies at once) |
+| `--lock-lease` | `C64U_LOCK_LEASE` | 10 seconds kept after each call; range 0–300 (0 releases after each call) |
 
 CLI options override environment values. Host accepts a hostname, IP, optional
 port, or HTTP(S) root URL, with optional `/v1`. It does not accept credentials,
@@ -76,25 +77,50 @@ query strings, fragments, or arbitrary URL paths. LAN requests bypass system pro
 | Files | `file_info`, `create_disk_image` |
 | Input | `get_input_state`, `send_input`, `release_all_inputs`, `type_text` |
 | Screens/streams | `read_text_screen`, `read_menu_screen`, `capture_screenshot`, `start_stream`, `stop_stream` |
+| Sharing | `claim_device`, `release_device`, `device_lock_status` |
 
 Tools advertise JSON schemas and read-only/destructive annotations. Results include
 structured JSON and readable text. Screenshots return MCP image content.
 Machine operations and entire input/capture workflows are serialized per server.
 
-Several agents often drive one C64U, each through its own server process. The
-multi-step and destructive tools (`upload_reu`, `type_text`,
-`capture_screenshot`, `start_stream`, `stop_stream`, `run_prg`, `run_crt`,
-`load_prg`, `play_sid`, `play_mod`, `reset_machine`, `reboot_machine`,
-`poweroff_machine`, `pause_machine`, `resume_machine`) and the input tools
-(`send_input`, `release_all_inputs`) therefore also take an
-OS file lock, `c64umcp-<host>.lock` in the lock directory, for their whole
-run, including cleanup. A second server on **the same computer** waits for
-it, so one agent's pause, reset, upload, typing or capture cannot interleave
-with another's. The wait is bounded by the lock timeout, after which the call
-fails; while waiting, the server's other tools keep working. The lock file
-only needs read access, so servers run by different users can share it. The lock does not reach servers on other computers, servers using
-another lock directory, or the same device configured under another
-hostname or address; other tools are serialized per process only.
+Several agents often drive one C64U, each through its own server process.
+Every device call therefore holds an OS file lock, `c64umcp-<address>.lock` in
+the lock directory, for its whole run, including cleanup, so calls from
+different servers on **the same computer** never interleave. The lock is
+named after the device's IP address, so `c64u.local` and its address share
+one lock. A hostname is resolved each time a server takes the device afresh;
+if that fails, the server uses the last address it resolved, and with none
+the call fails rather than lock under a different name. Configuring the C64U
+by IP address avoids the lookup.
+
+A server keeps the device for an idle lease (`--lock-lease`) after its last
+call, so another agent cannot slip in between one agent's `run_prg`,
+`type_text` and `capture_screenshot`. Read-only calls (`get_version`,
+`get_info`, `list_config_categories`, `get_config`, `read_debug_register`,
+`list_drives`, `get_input_state`, `file_info`, `read_memory`,
+`read_menu_screen`, `read_text_screen`) hold the device only while they run:
+they neither start nor extend the lease, so an agent polling the screen does
+not lock others out. `claim_device` keeps the device for up to 600 seconds
+across calls, and `release_device` hands it back at once. Shutdown also
+releases it, and if a server crashes, the OS releases its lock.
+
+A call made while another server holds the device waits up to the lock
+timeout, then fails without sending anything to the device. The error
+message starts with `device busy:` and names the owner, from a record
+`c64umcp-<address>.owner.json` next to the lock file:
+
+```text
+device busy: C64U 192.168.66.178 is in use by another MCP server (pid 4321, client "claude-code 2.1.0", finished run_prg 1.2s ago and keeps the device for 8.8s more (idle lease)). Request denied after waiting 2.0s; nothing was sent to the device. Retry later, or ask the agent using it to call release_device.
+```
+
+`device_lock_status` reports whether this server holds the device and for
+how long, or which other server does. To check another server, it briefly
+tries the lock, so a server with a lock timeout of 0 could be denied in that
+instant. While a call waits, the server's other tools wait on its own
+per-process gate. The lock file only needs read access, so servers run by
+different users can share it. The lock does not reach servers on other
+computers or servers using another lock directory. Lock files were named
+differently before this scheme, so restart every c64u server after upgrading.
 Annotations describe effects; they are not a separate permission system.
 On a normal MCP stdin close, the server waits (up to 10 seconds) for active
 handlers and bounded keyboard/video cleanup, then releases inputs it still
